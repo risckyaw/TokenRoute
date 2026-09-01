@@ -16,13 +16,13 @@ type Key struct {
 	ID            int64      `json:"id"`
 	Key           string     `json:"key"`
 	Name          string     `json:"name"`
-	RPM           int        `json:"rpm"`          // requests/min; 0 = unlimited
-	TPM           int        `json:"tpm"`          // tokens/min; 0 = unlimited
-	ModelRPM      int        `json:"model_rpm"`    // per-(key,model) requests/min; 0 = use RPM
+	RPM           int        `json:"rpm"`             // requests/min; 0 = unlimited
+	TPM           int        `json:"tpm"`             // tokens/min; 0 = unlimited
+	ModelRPM      int        `json:"model_rpm"`       // per-(key,model) requests/min; 0 = use RPM
 	LimitByHeader string     `json:"limit_by_header"` // when set, rate-limit identity = this header's value
 	DailyQuota    int64      `json:"daily_quota"`     // max requests per UTC day; 0 = unlimited
 	DailyUsed     int64      `json:"daily_used"`      // requests used in the current UTC day
-	QuotaTokens   int64      `json:"quota_tokens"` // lifetime cap; 0 = unlimited
+	QuotaTokens   int64      `json:"quota_tokens"`    // lifetime cap; 0 = unlimited
 	SpentTokens   int64      `json:"spent_tokens"`
 	BudgetUSD     float64    `json:"budget_usd"` // lifetime USD cap; 0 = unlimited
 	SpentUSD      float64    `json:"spent_usd"`

@@ -108,12 +108,37 @@ func (p *KeyPool) RecordUse(key string) {
 
 // Cool marks a key unusable for KeyCooldown (upstream 401/429).
 func (p *KeyPool) Cool(key string) {
+	p.CoolUntil(key, time.Now().Add(KeyCooldown))
+}
+
+// CoolUntil marks a key unusable until the given time (upstream-signalled
+// rate-limit reset). Zero cap: the caller bounds the duration.
+func (p *KeyPool) CoolUntil(key string, until time.Time) {
 	if key == "" {
 		return
 	}
 	p.mu.Lock()
-	p.cool[key] = time.Now().Add(KeyCooldown)
+	p.cool[key] = until
 	p.mu.Unlock()
+}
+
+// EarliestCooldown returns the soonest cooldown expiry across keys
+// (zero when none are cooling).
+func (p *KeyPool) EarliestCooldown() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var earliest time.Time
+	now := time.Now()
+	for k, until := range p.cool {
+		if now.After(until) {
+			delete(p.cool, k)
+			continue
+		}
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	return earliest
 }
 
 // Cooling reports whether the key is currently in cooldown (for tests).

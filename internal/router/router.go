@@ -160,6 +160,22 @@ func (r *Router) LockModel(providerName, model string, d time.Duration) {
 	r.lockMu.Unlock()
 }
 
+// ModelLockUntil returns when the provider+model lock expires
+// (zero when not locked).
+func (r *Router) ModelLockUntil(providerName, model string) time.Time {
+	r.lockMu.Lock()
+	defer r.lockMu.Unlock()
+	until, ok := r.modelLock[providerName+"|"+model]
+	if !ok {
+		return time.Time{}
+	}
+	if time.Now().After(until) {
+		delete(r.modelLock, providerName+"|"+model)
+		return time.Time{}
+	}
+	return until
+}
+
 // IsModelLocked reports whether provider+model is currently locked out.
 func (r *Router) IsModelLocked(providerName, model string) bool {
 	r.lockMu.Lock()

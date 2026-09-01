@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
+	"github.com/Jarvisagentic/tokenroute/internal/catalog"
 	"github.com/Jarvisagentic/tokenroute/internal/config"
 	"github.com/Jarvisagentic/tokenroute/internal/metrics"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
@@ -24,6 +27,7 @@ import (
 	"github.com/Jarvisagentic/tokenroute/internal/provider/openai"
 	"github.com/Jarvisagentic/tokenroute/internal/ratelimit"
 	"github.com/Jarvisagentic/tokenroute/internal/router"
+	"github.com/Jarvisagentic/tokenroute/internal/search"
 	"github.com/Jarvisagentic/tokenroute/internal/server"
 	"github.com/Jarvisagentic/tokenroute/internal/usage"
 )
@@ -42,6 +46,8 @@ type serverState struct {
 	// streamIdleMs is the per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
 	maxBodyMB    int
+	// searchBackends: ordered web-search upstreams for /v1/search.
+	searchBackends []search.Backend
 }
 
 func buildState(cfg *config.Config) (*serverState, error) {
@@ -131,7 +137,25 @@ func buildState(cfg *config.Config) (*serverState, error) {
 			})
 		}
 	}
-	return &serverState{router: rt, prices: prices, streamIdleMs: sit, maxBodyMB: cfg.MaxBodyMB}, nil
+	backends := make([]search.Backend, 0, len(cfg.Search))
+	for _, sc := range cfg.Search {
+		keys := append([]string(nil), sc.APIKeys...)
+		if sc.APIKey != "" {
+			keys = append(keys, sc.APIKey)
+		}
+		pool := provider.NewKeyPool(keys...)
+		switch strings.ToLower(sc.Backend) {
+		case "tavily":
+			backends = append(backends, &search.Tavily{Pool: pool})
+		case "brave":
+			backends = append(backends, &search.Brave{Pool: pool})
+		case "exa":
+			backends = append(backends, &search.Exa{Pool: pool})
+		default:
+			return nil, fmt.Errorf("unknown search backend %q", sc.Backend)
+		}
+	}
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
@@ -193,6 +217,16 @@ func main() {
 	mreg := metrics.New()
 	state.metrics = mreg
 	bindMetrics(mreg, state.router)
+
+	// Daily model-capability sync (models.dev) — strictly additive below
+	// the hand-written price table; "off" disables.
+	if !strings.EqualFold(cfg.ModelCatalog, "off") {
+		syncer := catalog.NewSyncer(
+			filepath.Join(filepath.Dir(cfg.UsageDB), "model-catalog.json"),
+			"", 0, state.prices,
+		)
+		go syncer.Run(context.Background())
+	}
 	var current atomic.Pointer[serverState]
 	current.Store(state)
 
@@ -208,11 +242,12 @@ func main() {
 		server.NewWithOptions(server.Options{
 			Router: st.router, Usage: st.usage, Prices: st.prices,
 			Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
-			Cache:         st.cache,
-			Metrics:       st.metrics,
-			SeparateAdmin: cfg.AdminListen != "",
-			StreamIdleMs:  st.streamIdleMs,
-			MaxBodyMB:     st.maxBodyMB,
+			Cache:          st.cache,
+			Metrics:        st.metrics,
+			SeparateAdmin:  cfg.AdminListen != "",
+			StreamIdleMs:   st.streamIdleMs,
+			MaxBodyMB:      st.maxBodyMB,
+			SearchBackends: st.searchBackends,
 		}).ServeHTTP(w, r)
 	})
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler}

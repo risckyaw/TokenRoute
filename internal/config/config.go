@@ -65,16 +65,28 @@ type CacheConfig struct {
 	TTLSeconds int  `yaml:"ttl_seconds"` // default 300
 }
 
+// SearchConfig wires one web-search backend for POST /v1/search.
+type SearchConfig struct {
+	Backend string   `yaml:"backend"` // tavily | brave | exa
+	APIKey  string   `yaml:"api_key"`
+	APIKeys []string `yaml:"api_keys"` // pool; api_key appended when set
+}
+
 type Config struct {
-	Listen      string                 `yaml:"listen"`
-	AdminListen string                 `yaml:"admin_listen"` // optional dedicated admin listener
-	UsageDB     string                 `yaml:"usage_db"`
-	AdminKey    string                 `yaml:"admin_key"`
-	MaxBodyMB   int                    `yaml:"max_body_mb"` // request body cap; default 10
-	Cache       CacheConfig            `yaml:"cache"`
-	Providers   []ProviderConfig       `yaml:"providers"`
-	Routes      []RouteConfig          `yaml:"routes"`
-	Prices      map[string]PriceConfig `yaml:"prices"`
+	Listen      string      `yaml:"listen"`
+	AdminListen string      `yaml:"admin_listen"` // optional dedicated admin listener
+	UsageDB     string      `yaml:"usage_db"`
+	AdminKey    string      `yaml:"admin_key"`
+	MaxBodyMB   int         `yaml:"max_body_mb"` // request body cap; default 10
+	Cache       CacheConfig `yaml:"cache"`
+	// ModelCatalog controls daily models.dev capability sync: "off"
+	// disables; empty/other enables with the cache beside usage_db.
+	ModelCatalog string `yaml:"model_catalog"`
+	// Search lists web-search backends for POST /v1/search, tried in order.
+	Search    []SearchConfig         `yaml:"search"`
+	Providers []ProviderConfig       `yaml:"providers"`
+	Routes    []RouteConfig          `yaml:"routes"`
+	Prices    map[string]PriceConfig `yaml:"prices"`
 }
 
 func Load(path string) (*Config, error) {
@@ -94,6 +106,12 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	cfg.AdminKey = expandIfPresent(cfg.AdminKey)
+	for i := range cfg.Search {
+		cfg.Search[i].APIKey = expandIfPresent(cfg.Search[i].APIKey)
+		for j := range cfg.Search[i].APIKeys {
+			cfg.Search[i].APIKeys[j] = expandIfPresent(cfg.Search[i].APIKeys[j])
+		}
+	}
 	if cfg.Listen == "" {
 		cfg.Listen = ":8400"
 	}

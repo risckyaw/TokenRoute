@@ -157,3 +157,18 @@ routes:
 #cache:
 #  enabled: true
 #  ttl_seconds: 300
+
+# Daily model-capability sync from models.dev (context windows, strictly
+# additive below the hand-written price table). Default: on. Cache file
+# lands beside usage_db as model-catalog.json.
+#model_catalog: off
+
+# POST /v1/search — web search with per-backend key pools, tried in order
+# until one returns results. Each backend: tavily | brave | exa.
+#search:
+#  - backend: tavily
+#    api_key: $TAVILY_API_KEY
+#  - backend: brave
+#    api_keys: [$BRAVE_KEY_A, $BRAVE_KEY_B]
+#  - backend: exa
+#    api_key: $EXA_API_KEY

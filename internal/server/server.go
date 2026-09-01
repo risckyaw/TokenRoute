@@ -23,6 +23,7 @@ import (
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/ratelimit"
 	"github.com/Jarvisagentic/tokenroute/internal/router"
+	"github.com/Jarvisagentic/tokenroute/internal/search"
 	"github.com/Jarvisagentic/tokenroute/internal/usage"
 )
 
@@ -78,6 +79,8 @@ type Options struct {
 	StreamIdleMs map[string]int
 	// MaxBodyMB caps request bodies (0 = default 10MB).
 	MaxBodyMB int
+	// SearchBackends enables POST /v1/search when non-empty.
+	SearchBackends []search.Backend
 }
 
 // New builds the handler. Kept for compatibility: auth disabled.
@@ -88,7 +91,7 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB)}
+		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
 	mux := chi.NewRouter()
 	mux.Use(correlationID)
 	mux.Get("/healthz", s.healthz)
@@ -101,6 +104,7 @@ func NewWithOptions(o Options) http.Handler {
 		r.Use(timeoutOverride)
 		r.Post("/v1/chat/completions", s.chatCompletions)
 		r.Post("/v1/embeddings", s.embeddings)
+		r.Post("/v1/search", s.searchHandler)
 		r.Get("/v1/models", s.models)
 		r.Get("/v1/usage/recent", s.usageRecent)
 	})
@@ -156,6 +160,8 @@ type srv struct {
 	// streamIdleMs: per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
 	maxBody      int64
+	// searchBackends: ordered web-search upstreams for /v1/search.
+	searchBackends []search.Backend
 }
 
 // maxBodyBytes converts MB to bytes; 0/negative -> 10MB default.
@@ -480,7 +486,17 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 			att.Body.Close()
 			s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
 			if att.StatusCode == http.StatusTooManyRequests {
-				s.router.LockModel(c.Provider.Name(), c.Model, 30*time.Second)
+				// Quota-aware lock: honor the upstream-signalled reset
+				// (rate-limit headers, then Retry-After) so an exhausted
+				// model/key pair stays skipped exactly until its quota
+				// window resets instead of a flat blind cooldown.
+				lock := 30 * time.Second
+				if d := rateLimitReset(att.Header); d > 0 {
+					lock = d
+				} else if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 {
+					lock = d
+				}
+				s.router.LockModel(c.Provider.Name(), c.Model, lock)
 				// After RecordResult so the custom duration isn't clobbered.
 				if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 {
 					s.router.OpenCircuitFor(c.Provider.Name(), d)
@@ -511,11 +527,22 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 
 // relayAllFailed writes the terminal response when every candidate failed:
 // the last retryable upstream response as-is, else a 502 transport error.
+// When the failure is an upstream 429, the Retry-After header is raised to
+// the earliest known reset across model locks and the upstream hint.
 func (s *srv) relayAllFailed(w http.ResponseWriter, entry *usage.Entry, lastFailResp *http.Response, lastErr error) {
 	if lastFailResp != nil {
 		// All candidates failed with retryable upstream statuses:
 		// relay the last one as-is (Phase 1 transparency).
 		entry.Status = lastFailResp.StatusCode
+		if lastFailResp.StatusCode == http.StatusTooManyRequests {
+			if until := s.router.ModelLockUntil(entry.Provider, entry.Model); !until.IsZero() {
+				secs := int(time.Until(until).Seconds()) + 1
+				cur, _ := strconv.Atoi(lastFailResp.Header.Get("Retry-After"))
+				if secs > cur {
+					lastFailResp.Header.Set("Retry-After", strconv.Itoa(secs))
+				}
+			}
+		}
 		s.relayFull(w, lastFailResp, entry)
 	} else {
 		writeErr(w, http.StatusBadGateway, "upstream error: "+lastErr.Error(), "upstream_error")
@@ -772,6 +799,41 @@ func setDecisionHeader(w http.ResponseWriter, cand router.Candidate, strategy st
 		";model="+cand.Model+";strategy="+strategy+";attempts="+strconv.Itoa(attempts))
 }
 
+// maxRateLimitReset caps upstream-signalled rate-limit resets (24h).
+const maxRateLimitReset = 24 * time.Hour
+
+// rateLimitReset parses the reset time from standard rate-limit response
+// headers, returning the duration until reset. Checked in order:
+// x-ratelimit-reset-requests (unix seconds or duration), x-ratelimit-reset,
+// x-ratelimit-reset-tokens. Garbage/absent -> 0. Capped at maxRateLimitReset.
+func rateLimitReset(h http.Header) time.Duration {
+	for _, name := range []string{
+		"X-Ratelimit-Reset-Requests", "X-Ratelimit-Reset", "X-Ratelimit-Reset-Tokens",
+	} {
+		v := strings.TrimSpace(h.Get(name))
+		if v == "" {
+			continue
+		}
+		var d time.Duration
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			if n > 1_000_000_000 { // unix seconds
+				d = time.Until(time.Unix(n, 0))
+			} else { // duration in seconds
+				d = time.Duration(n) * time.Second
+			}
+		} else if t, err := http.ParseTime(v); err == nil {
+			d = time.Until(t)
+		}
+		if d > maxRateLimitReset {
+			return maxRateLimitReset
+		}
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 // parseRetryAfter parses a Retry-After value (seconds int or http-date);
 // garbage -> 0.
 func parseRetryAfter(v string) time.Duration {
@@ -805,7 +867,13 @@ func retryableStatus(code int) bool {
 func (s *srv) logEntry(ctx context.Context, e usage.Entry) {
 	s.recordMetrics(e)
 	if s.usage != nil {
-		if err := s.usage.Log(ctx, e); err != nil {
+		// Usage side effects must survive the client connection: a client
+		// that disconnects at the terminal stream event cancels its request
+		// context, which must not cancel the usage write (9router lost
+		// billing data to this). Give the log its own bounded context.
+		logCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.usage.Log(logCtx, e); err != nil {
 			slog.Error("usage log", "err", err, "request_id", e.RequestID)
 		}
 	}
