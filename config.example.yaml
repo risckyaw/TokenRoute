@@ -1,0 +1,105 @@
+listen: ":8400"
+usage_db: "data/usage.db"
+
+# Admin API key (X-Admin-Key header). Empty/missing -> /admin routes return 503.
+admin_key: "${GATEWAY_ADMIN_KEY}"
+
+# USD per 1M tokens, keyed by UPSTREAM model name.
+prices:
+  deepseek-chat: {prompt_per_1m: 0.14, completion_per_1m: 0.28}
+  gpt-4o-mini:   {prompt_per_1m: 0.15, completion_per_1m: 0.60}
+  gpt-4o:        {prompt_per_1m: 2.50, completion_per_1m: 10.00}
+
+providers:
+  # Secrets via env vars only — never commit real keys.
+  - name: openai
+    type: openai
+    base_url: "https://api./v1"
+    api_key: "${OPENAI_API_KEY}"   # ${VAR} expanded from environment
+    priority: 10
+    timeout_ms: 120000
+    # Optional per-provider circuit breaker (defaults shown):
+    # opens after N consecutive failures, cools down, then allows 1 probe.
+    circuit: {failure_threshold: 3, cooldown_ms: 30000}
+
+  - name: deepseek
+    type: openai                    # openai-compatible API
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    priority: 5                     # lower = more preferred
+    timeout_ms: 120000
+
+  - name: ollama
+    type: openai
+    base_url: "http://localhost:11434/v1"
+    # no api_key needed for local Ollama
+    priority: 20
+    timeout_ms: 300000
+
+  # Anthropic Messages API (translated to/from OpenAI format at the boundary).
+  # - name: anthropic
+  #   type: anthropic
+  #   base_url: "https://api.anthropic.com/v1"   # optional, this is the default
+  #   api_key: "${ANTHROPIC_API_KEY}"
+  #   priority: 15
+  #   timeout_ms: 120000
+
+  # Google Gemini generateContent API (translated to/from OpenAI format).
+  # - name: gemini
+  #   type: gemini
+  #   base_url: "https://generativelanguage.googleapis.com/v1beta"  # default
+  #   api_key: "${GEMINI_API_KEY}"
+  #   priority: 25
+  #   timeout_ms: 120000
+
+routes:
+  # Virtual model names clients use in "model" field.
+  # strategy: priority (default) | round_robin | least_latency | weighted | cost
+  # Failover: retryable statuses (429/500/502/503/504) and transport errors
+  # fall through to the next candidate; other statuses are relayed as-is.
+  - model: auto
+    strategy: priority              # first candidate by priority; failover on retryable errors
+    candidates:
+      - provider: deepseek
+        model: deepseek-chat
+      - provider: openai
+        model: gpt-4o-mini
+
+  - model: balanced
+    strategy: round_robin           # rotate starting candidate each request
+    candidates:
+      - provider: deepseek
+        model: deepseek-chat
+      - provider: openai
+        model: gpt-4o-mini
+
+  - model: fast
+    strategy: least_latency         # lowest EMA latency first; unseen providers first
+    candidates:
+      - provider: ollama
+        model: llama3.1
+      - provider: deepseek
+        model: deepseek-chat
+
+  - model: mixed
+    strategy: weighted              # weighted-random first pick (weight default 1);
+    candidates:                     # remaining candidates stay in priority order
+      - provider: deepseek
+        model: deepseek-chat
+        weight: 80
+      - provider: openai
+        model: gpt-4o-mini
+        weight: 20
+
+  - model: cheap
+    strategy: cost                  # lowest prompt+completion price first;
+    candidates:                     # unpriced models sort last
+      - provider: openai
+        model: gpt-4o
+      - provider: deepseek
+        model: deepseek-chat
+
+  - model: smart
+    candidates:                     # no strategy -> priority
+      - provider: openai
+        model: gpt-4o

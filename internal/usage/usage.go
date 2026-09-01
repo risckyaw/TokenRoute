@@ -1,0 +1,211 @@
+// Package usage records per-request token usage and cost in SQLite.
+package usage
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // driver name "sqlite"
+)
+
+// Price is the per-model pricing in USD per 1M tokens.
+type Price struct {
+	PromptPer1M     float64 `yaml:"prompt_per_1m"`
+	CompletionPer1M float64 `yaml:"completion_per_1m"`
+}
+
+// Entry is one logged request.
+type Entry struct {
+	RequestID        string    `json:"request_id"`
+	TS               time.Time `json:"ts"`
+	KeyID            int64     `json:"key_id"`
+	KeyName          string    `json:"key_name"`
+	VirtualModel     string    `json:"virtual_model"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	Stream           bool      `json:"stream"`
+	Status           int       `json:"status"`
+	LatencyMs        int64     `json:"latency_ms"`
+	CostUSD          *float64  `json:"cost_usd"`
+}
+
+// KeyAggregate is the per-key usage rollup for the admin API.
+type KeyAggregate struct {
+	KeyID      int64   `json:"key_id"`
+	KeyName    string  `json:"key_name"`
+	Requests   int     `json:"requests"`
+	TotalToken int     `json:"total_tokens"`
+	CostUSD    float64 `json:"cost_usd"`
+}
+
+// Cost computes USD cost for the given token counts; nil when price unknown.
+func Cost(promptTokens, completionTokens int, p *Price) *float64 {
+	if p == nil {
+		return nil
+	}
+	c := float64(promptTokens)/1e6*p.PromptPer1M + float64(completionTokens)/1e6*p.CompletionPer1M
+	return &c
+}
+
+type Logger struct {
+	db *sql.DB
+}
+
+// OpenDB opens (creating if needed) the SQLite DB at path, creating parent
+// dirs, and creates/migrates the usage_logs table. One *sql.DB is shared by
+// usage.Logger and auth.Store.
+func OpenDB(path string) (*sql.DB, error) {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create usage db dir: %w", err)
+		}
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open usage db: %w", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS usage_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_id TEXT,
+		ts TEXT,
+		virtual_model TEXT,
+		provider TEXT,
+		model TEXT,
+		prompt_tokens INTEGER,
+		completion_tokens INTEGER,
+		total_tokens INTEGER,
+		stream INTEGER,
+		status INTEGER,
+		latency_ms INTEGER,
+		cost_usd REAL
+	)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create usage table: %w", err)
+	}
+	// Phase 4 columns; ALTER fails on existing DBs that have them, so add
+	// only when missing (checked via pragma).
+	for _, col := range []string{"key_id INTEGER", "key_name TEXT"} {
+		name := strings.SplitN(col, " ", 2)[0]
+		if !hasColumn(db, "usage_logs", name) {
+			if _, err := db.Exec(`ALTER TABLE usage_logs ADD COLUMN ` + col); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("migrate usage_logs: %w", err)
+			}
+		}
+	}
+	return db, nil
+}
+
+func hasColumn(db *sql.DB, table, col string) bool {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err == nil && n == col {
+			return true
+		}
+	}
+	return false
+}
+
+// NewLogger wraps a shared DB handle.
+func NewLogger(db *sql.DB) *Logger { return &Logger{db: db} }
+
+// Open opens (creating if needed) the SQLite DB at path, creating parent dirs.
+func Open(path string) (*Logger, error) {
+	db, err := OpenDB(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Logger{db: db}, nil
+}
+
+// Log inserts one entry. Called synchronously after the response relay ends.
+func (l *Logger) Log(ctx context.Context, e Entry) error {
+	var cost any
+	if e.CostUSD != nil {
+		cost = *e.CostUSD
+	}
+	_, err := l.db.ExecContext(ctx, `INSERT INTO usage_logs
+		(request_id, ts, key_id, key_name, virtual_model, provider, model, prompt_tokens,
+		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.RequestID, e.TS.UTC().Format(time.RFC3339Nano), e.KeyID, e.KeyName,
+		e.VirtualModel, e.Provider, e.Model,
+		e.PromptTokens, e.CompletionTokens, e.TotalTokens, boolInt(e.Stream),
+		e.Status, e.LatencyMs, cost)
+	return err
+}
+
+// QueryRecent returns the newest entries, up to limit.
+func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
+	rows, err := l.db.Query(`SELECT request_id, ts, key_id, key_name, virtual_model, provider, model,
+		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd
+		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Entry{}
+	for rows.Next() {
+		var e Entry
+		var ts, keyName string
+		var stream int
+		var cost sql.NullFloat64
+		if err := rows.Scan(&e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
+			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
+			&e.Status, &e.LatencyMs, &cost); err != nil {
+			return nil, err
+		}
+		e.KeyName = keyName
+		e.TS, _ = time.Parse(time.RFC3339Nano, ts)
+		e.Stream = stream != 0
+		if cost.Valid {
+			c := cost.Float64
+			e.CostUSD = &c
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// AggregateByKey rolls up requests/tokens/cost per API key (key_id 0 =
+// requests logged without a key, e.g. pre-Phase-4 rows).
+func (l *Logger) AggregateByKey() ([]KeyAggregate, error) {
+	rows, err := l.db.Query(`SELECT key_id, COALESCE(key_name,''), COUNT(*),
+		COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0)
+		FROM usage_logs GROUP BY key_id, key_name ORDER BY key_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []KeyAggregate{}
+	for rows.Next() {
+		var a KeyAggregate
+		if err := rows.Scan(&a.KeyID, &a.KeyName, &a.Requests, &a.TotalToken, &a.CostUSD); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (l *Logger) Close() error { return l.db.Close() }
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}

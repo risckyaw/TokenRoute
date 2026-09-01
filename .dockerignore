@@ -1,0 +1,7 @@
+data/
+*.db
+.git
+AGENTS.md
+CLAUDE.md
+README.md
+scripts/

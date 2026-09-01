@@ -1,0 +1,19 @@
+# Binaries
+/tokenroute
+*.exe
+
+# Data / databases
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config with secrets (use config.example.yaml as template)
+config.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
