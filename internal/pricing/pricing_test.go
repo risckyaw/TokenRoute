@@ -30,6 +30,24 @@ func TestMergeConfigWins(t *testing.T) {
 	}
 }
 
+func TestFlexIntToleratesStringsAndFloats(t *testing.T) {
+	for in, want := range map[string]flexInt{
+		`128000`:     128000,
+		`"128000"`:   128000,
+		`"128000.0"`: 128000,
+		`null`:       0,
+		`"unknown"`:  0,
+	} {
+		var f flexInt
+		if err := f.UnmarshalJSON([]byte(in)); err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		if f != want {
+			t.Fatalf("%s = %d, want %d", in, f, want)
+		}
+	}
+}
+
 func TestMergeEmbeddingMode(t *testing.T) {
 	shared := map[string]usage.Price{}
 	s := NewSyncer(shared)

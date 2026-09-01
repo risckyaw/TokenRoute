@@ -4,12 +4,14 @@
 package pricing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,10 +45,30 @@ func (s *Syncer) Count() int {
 type litellmEntry struct {
 	InputCostPerToken  float64 `json:"input_cost_per_token"`
 	OutputCostPerToken float64 `json:"output_cost_per_token"`
-	MaxInputTokens     int     `json:"max_input_tokens"`
-	MaxTokens          int     `json:"max_tokens"`
+	MaxInputTokens     flexInt `json:"max_input_tokens"`
+	MaxTokens          flexInt `json:"max_tokens"`
 	LiteLLMProvider    string  `json:"litellm_provider"`
 	Mode               string  `json:"mode"`
+}
+
+// flexInt tolerates JSON numbers and numeric strings ("128000") — LiteLLM's
+// catalog mixes both in max_*_tokens fields.
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	b = bytes.Trim(b, `"`)
+	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
+		*f = 0
+		return nil
+	}
+	// Some rows are floats ("128000.0"); parse via float then truncate.
+	v, err := strconv.ParseFloat(string(b), 64)
+	if err != nil {
+		*f = 0
+		return nil
+	}
+	*f = flexInt(int(v))
+	return nil
 }
 
 // Merge applies a parsed catalog to the shared map: only models with no
@@ -68,10 +90,10 @@ func (s *Syncer) Merge(catalog map[string]litellmEntry) int {
 		p := usage.Price{
 			PromptPer1M:     e.InputCostPerToken * 1e6,
 			CompletionPer1M: e.OutputCostPerToken * 1e6,
-			ContextTokens:   e.MaxInputTokens,
+			ContextTokens:   int(e.MaxInputTokens),
 		}
 		if p.ContextTokens == 0 {
-			p.ContextTokens = e.MaxTokens
+			p.ContextTokens = int(e.MaxTokens)
 		}
 		if e.Mode == "embedding" {
 			p.EmbedPer1M = p.PromptPer1M
@@ -110,9 +132,22 @@ func (s *Syncer) FetchOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("pricing read: %w", err)
 	}
-	var catalog map[string]litellmEntry
-	if err := json.Unmarshal(body, &catalog); err != nil {
+	// Decode per-entry: the catalog's sample_spec (and occasional junk rows)
+	// carry non-numeric fields that would fail a whole-document unmarshal.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return fmt.Errorf("pricing parse: %w", err)
+	}
+	catalog := make(map[string]litellmEntry, len(raw))
+	for name, blob := range raw {
+		if name == "sample_spec" {
+			continue
+		}
+		var e litellmEntry
+		if err := json.Unmarshal(blob, &e); err != nil {
+			continue
+		}
+		catalog[name] = e
 	}
 	s.Merge(catalog)
 	return nil
