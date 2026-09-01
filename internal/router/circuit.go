@@ -12,6 +12,12 @@ type CircuitConfig struct {
 	// AutoDisableAfter: after N open-transitions the breaker enters the
 	// disabled state (Allow always false) until Enable; 0 = never.
 	AutoDisableAfter int // default 3
+	// Mode "percent" (LiteLLM DEFAULT_FAILURE_THRESHOLD_PERCENT): trip when
+	// failures in the current minute >= max(MinRequests, FailurePercent*total)
+	// AND failures >= 1. Default "consecutive" (current behavior).
+	Mode           string
+	FailurePercent float64 // default 0.5
+	MinRequests    int     // default 5
 }
 
 const (
@@ -42,6 +48,13 @@ type CircuitBreaker struct {
 	openCycles     int // open->half_open->open cycles (backoff escalation)
 	lastKind       FailureKind
 	now            func() time.Time // injectable for tests
+	// percent-mode rolling minute window (inert in consecutive mode)
+	mode           string
+	failurePercent float64
+	minRequests    int
+	winStart       time.Time
+	winTotal       int
+	winFailures    int
 }
 
 func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
@@ -59,7 +72,38 @@ func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
 		// never disable, or switch to *int when a real "never" knob is needed.
 		autoDisable = 3
 	}
-	return &CircuitBreaker{threshold: threshold, cooldown: cooldown, autoDisable: autoDisable, now: time.Now}
+	cb := &CircuitBreaker{threshold: threshold, cooldown: cooldown, autoDisable: autoDisable, now: time.Now}
+	if cfg.Mode == "percent" {
+		cb.mode = "percent"
+		cb.failurePercent = cfg.FailurePercent
+		if cb.failurePercent <= 0 {
+			cb.failurePercent = 0.5
+		}
+		cb.minRequests = cfg.MinRequests
+		if cb.minRequests <= 0 {
+			cb.minRequests = 5
+		}
+	}
+	return cb
+}
+
+// recordWindow feeds the percent-mode rolling minute window; returns true
+// when the failure ratio trips the circuit (LiteLLM percent threshold).
+func (c *CircuitBreaker) recordWindow(success bool) bool {
+	now := c.now()
+	if now.Sub(c.winStart) >= 60*time.Second {
+		c.winStart, c.winTotal, c.winFailures = now, 0, 0
+	}
+	c.winTotal++
+	if success {
+		return false
+	}
+	c.winFailures++
+	need := int(c.failurePercent * float64(c.winTotal))
+	if need < c.minRequests {
+		need = c.minRequests
+	}
+	return c.winFailures >= need && c.winFailures >= 1
 }
 
 // degradationThreshold is the failure count at which the breaker enters the
@@ -165,6 +209,9 @@ func (c *CircuitBreaker) Enable() {
 func (c *CircuitBreaker) OnSuccess() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.mode == "percent" {
+		c.recordWindow(true)
+	}
 	c.state = stateClosed
 	c.failures = 0
 	c.openCycles = 0
@@ -189,6 +236,19 @@ func (c *CircuitBreaker) OnFailureKind(kind FailureKind, countsAgainstProvider b
 		return
 	}
 	c.lastKind = kind
+	if c.mode == "percent" {
+		trip := c.recordWindow(false)
+		// A failed half-open probe always reopens, regardless of ratio.
+		if c.state == stateHalfOpen {
+			c.openCycles++
+			c.open()
+			return
+		}
+		if trip {
+			c.open()
+		}
+		return
+	}
 	if kind == FailureAuth || kind == FailurePermission {
 		c.failures = c.threshold
 		if c.state == stateHalfOpen {

@@ -15,6 +15,11 @@ type CircuitConfig struct {
 	// AutoDisableAfter: after N open-transitions the breaker stays disabled
 	// until manually re-enabled (default 3; 0 = never auto-disable).
 	AutoDisableAfter int `yaml:"auto_disable_after"`
+	// Mode "percent" trips on a failure RATIO in the current minute
+	// (LiteLLM DEFAULT_FAILURE_THRESHOLD_PERCENT); default "consecutive".
+	Mode           string  `yaml:"mode"`
+	FailurePercent float64 `yaml:"failure_percent"` // default 0.5
+	MinRequests    int     `yaml:"min_requests"`    // default 5
 }
 
 type ProviderConfig struct {

@@ -89,3 +89,75 @@ func TestCircuitRecovery(t *testing.T) {
 		t.Fatal("closed circuit must allow requests")
 	}
 }
+
+func newPercentBreaker() *CircuitBreaker {
+	cb := NewCircuitBreaker(CircuitConfig{Mode: "percent", FailurePercent: 0.5, MinRequests: 5, CooldownMs: 30000})
+	now := time.Now()
+	cb.now = func() time.Time { return now }
+	return cb
+}
+
+func TestPercentTrip(t *testing.T) {
+	cb := newPercentBreaker()
+	// 5 failures / 5 total = 100% >= max(5, 0.5*5) -> trips at 5th failure.
+	for i := 0; i < 4; i++ {
+		cb.OnFailure()
+		if cb.State() != "closed" {
+			t.Fatalf("state after %d failures = %s, want closed", i+1, cb.State())
+		}
+	}
+	cb.OnFailure()
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open at 5/5 failures", cb.State())
+	}
+}
+
+func TestPercentBelowMinimumNoTrip(t *testing.T) {
+	cb := newPercentBreaker()
+	// 4 failures out of 4: 100% ratio but below min_requests=5.
+	for i := 0; i < 4; i++ {
+		cb.OnFailure()
+	}
+	if cb.State() != "closed" {
+		t.Fatalf("state = %s, want closed below min_requests", cb.State())
+	}
+	// High volume, low ratio: 6 failures in 20 total = 30% < 50% -> closed.
+	cb2 := newPercentBreaker()
+	for i := 0; i < 14; i++ {
+		cb2.OnSuccess()
+	}
+	for i := 0; i < 6; i++ {
+		cb2.OnFailure()
+	}
+	if cb2.State() != "closed" {
+		t.Fatalf("state = %s, want closed at 30 percent ratio", cb2.State())
+	}
+}
+
+func TestPercentMinuteRollover(t *testing.T) {
+	cb := newPercentBreaker()
+	for i := 0; i < 4; i++ {
+		cb.OnFailure()
+	}
+	// Window resets after 60s: counters restart, ratio no longer met.
+	base := cb.now()
+	cb.now = func() time.Time { return base.Add(61 * time.Second) }
+	cb.OnFailure() // 1/1 in the new window, below min_requests
+	if cb.State() != "closed" {
+		t.Fatalf("state = %s, want closed after minute rollover", cb.State())
+	}
+}
+
+func TestPercentHalfOpenProbeFailureReopens(t *testing.T) {
+	cb := newPercentBreaker()
+	for i := 0; i < 5; i++ {
+		cb.OnFailure()
+	}
+	base := cb.now()
+	cb.now = func() time.Time { return base.Add(31 * time.Second) }
+	cb.Allow() // -> half-open
+	cb.OnFailure()
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open after failed probe", cb.State())
+	}
+}

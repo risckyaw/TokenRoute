@@ -147,6 +147,9 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 				FailureThreshold: pc.Circuit.FailureThreshold,
 				CooldownMs:       pc.Circuit.CooldownMs,
 				AutoDisableAfter: pc.Circuit.AutoDisableAfter,
+				Mode:             pc.Circuit.Mode,
+				FailurePercent:   pc.Circuit.FailurePercent,
+				MinRequests:      pc.Circuit.MinRequests,
 			})
 		}
 		if pc.QuotaTokenLimit > 0 {
