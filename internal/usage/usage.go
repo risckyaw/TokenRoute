@@ -17,7 +17,8 @@ import (
 type Price struct {
 	PromptPer1M     float64 `yaml:"prompt_per_1m"`
 	CompletionPer1M float64 `yaml:"completion_per_1m"`
-	EmbedPer1M      float64 `yaml:"embed_per_1m"` // embeddings; 0 = fall back to PromptPer1M
+	EmbedPer1M      float64 `yaml:"embed_per_1m"`   // embeddings; 0 = fall back to PromptPer1M
+	ContextTokens   int     `yaml:"context_tokens"` // model context window; 0 = no guard
 }
 
 // Entry is one logged request.

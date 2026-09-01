@@ -54,6 +54,7 @@ func masked(k auth.Key) map[string]any {
 	return map[string]any{
 		"id": k.ID, "key": m, "name": k.Name, "rpm": k.RPM, "tpm": k.TPM,
 		"quota_tokens": k.QuotaTokens, "spent_tokens": k.SpentTokens,
+		"budget_usd": k.BudgetUSD, "spent_usd": k.SpentUSD,
 		"allowed_models": k.AllowedModels, "expires_at": k.ExpiresAt,
 		"enabled": k.Enabled, "created_at": k.CreatedAt,
 	}
@@ -64,6 +65,7 @@ type createKeyReq struct {
 	RPM           int      `json:"rpm"`
 	TPM           int      `json:"tpm"`
 	QuotaTokens   int64    `json:"quota_tokens"`
+	BudgetUSD     float64  `json:"budget_usd"`
 	AllowedModels []string `json:"allowed_models"`
 	ExpiresAt     *string  `json:"expires_at"` // RFC3339
 }
@@ -80,7 +82,8 @@ func (s *srv) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	k := auth.Key{
 		Name: req.Name, RPM: req.RPM, TPM: req.TPM,
-		QuotaTokens: req.QuotaTokens, AllowedModels: req.AllowedModels, Enabled: true,
+		QuotaTokens: req.QuotaTokens, BudgetUSD: req.BudgetUSD,
+		AllowedModels: req.AllowedModels, Enabled: true,
 	}
 	if req.ExpiresAt != nil && *req.ExpiresAt != "" {
 		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)

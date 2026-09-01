@@ -5,10 +5,11 @@ usage_db: "data/usage.db"
 admin_key: "${GATEWAY_ADMIN_KEY}"
 
 # USD per 1M tokens, keyed by UPSTREAM model name.
+# context_tokens (optional) enables the context-window guard for that model.
 prices:
-  deepseek-chat: {prompt_per_1m: 0.14, completion_per_1m: 0.28}
-  gpt-4o-mini:   {prompt_per_1m: 0.15, completion_per_1m: 0.60}
-  gpt-4o:        {prompt_per_1m: 2.50, completion_per_1m: 10.00}
+  deepseek-chat: {prompt_per_1m: 0.14, completion_per_1m: 0.28, context_tokens: 64000}
+  gpt-4o-mini:   {prompt_per_1m: 0.15, completion_per_1m: 0.60, context_tokens: 128000}
+  gpt-4o:        {prompt_per_1m: 2.50, completion_per_1m: 10.00, context_tokens: 128000}
 
 providers:
   # Secrets via env vars only — never commit real keys.

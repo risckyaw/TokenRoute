@@ -23,6 +23,16 @@ speak one API.
 - **Per-request budgets** — `X-Max-Cost-USD` header rejects requests whose
   worst-case estimate exceeds the budget (402 `budget_exceeded`); actual
   overruns flagged in the usage log.
+- **Per-key USD budgets** — `budget_usd` on virtual keys; cost accumulated
+  in `spent_usd` after each request, exhausted keys get 402
+  `budget_exceeded`.
+- **Context-window guard** — optional `context_tokens` per priced model;
+  oversized prompts skip that candidate (400 `context_length_exceeded`
+  when none fit).
+- **Prometheus metrics** — `GET /metrics` (no auth, both listeners):
+  request/token/cache counters, latency histogram, circuit-open gauge.
+- **Per-request timeout** — `X-Timeout-Ms` header overrides the provider
+  timeout for one request (capped at 600000).
 - **Provider key pools** — multiple API keys per provider, round-robin with
   60s cooldown on upstream 401/429.
 - **Failover + circuit breakers** — retryable statuses (429/5xx) and
@@ -97,6 +107,29 @@ budget the request is rejected with 402 `budget_exceeded`. Unpriced models
 always pass. When the *actual* cost exceeds the budget, the usage log row
 is flagged `budget_exceeded` (visible in `/admin/usage/export`).
 
+## Context-window guard
+
+Add `context_tokens` to a price entry to enforce the model's context
+window. The gateway estimates prompt tokens as len(messages JSON)/4
+(len(input)/4 for embeddings) and skips candidates whose window is too
+small; when every candidate is rejected the client gets 400
+`context_length_exceeded`. Entries without `context_tokens` (or 0) are
+never rejected.
+
+## Metrics
+
+`GET /metrics` exposes Prometheus text format on both the public and
+admin listeners (no auth): `tokenroute_requests_total{key,provider,model,
+status_class}`, `tokenroute_tokens_total{key,provider,kind}`,
+`tokenroute_cache_hits_total`, `tokenroute_latency_seconds{provider}`
+histogram, `tokenroute_circuit_open{provider}` gauge.
+
+## Per-request timeout
+
+`X-Timeout-Ms: <int>` wraps the upstream call in a context deadline for
+that request only (capped at 600000 ms). Exceeding it fails over like a
+transport error (502 when all candidates time out).
+
 ## Configuration
 
 `config.yaml` — secrets only via `${ENV_VAR}` placeholders:
@@ -106,7 +139,7 @@ is flagged `budget_exceeded` (visible in `/admin/usage/export`).
 | `listen` | Address, default `:8400` |
 | `usage_db` | SQLite path (usage logs + API keys), default `data/usage.db` |
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
-| `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m}` USD per 1M tokens |
+| `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard |
 | `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms}` (defaults 3/30000) |
 | `routes[]` | Virtual `model`, optional `strategy`, ordered `candidates` (`provider`, upstream `model`, optional `weight`) |
 
@@ -129,7 +162,7 @@ Header `X-Admin-Key: <admin_key>` on every call:
 
 | Route | Description |
 |---|---|
-| `POST /admin/keys` | Create key `{name, rpm, tpm, quota_tokens, allowed_models, expires_at}` — full key returned only here |
+| `POST /admin/keys` | Create key `{name, rpm, tpm, quota_tokens, budget_usd, allowed_models, expires_at}` — full key returned only here |
 | `GET /admin/keys` | List keys (masked) |
 | `POST /admin/keys/{id}/disable` / `/enable` | Toggle key |
 | `DELETE /admin/keys/{id}` | Delete key |

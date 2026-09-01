@@ -40,7 +40,8 @@ type RouteConfig struct {
 type PriceConfig struct {
 	PromptPer1M     float64 `yaml:"prompt_per_1m"`
 	CompletionPer1M float64 `yaml:"completion_per_1m"`
-	EmbedPer1M      float64 `yaml:"embed_per_1m"` // optional; falls back to prompt_per_1m
+	EmbedPer1M      float64 `yaml:"embed_per_1m"`   // optional; falls back to prompt_per_1m
+	ContextTokens   int     `yaml:"context_tokens"` // optional; 0 = no context guard
 }
 
 // CacheConfig controls the in-memory semantic response cache.

@@ -17,6 +17,7 @@ import (
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
 	"github.com/Jarvisagentic/tokenroute/internal/config"
+	"github.com/Jarvisagentic/tokenroute/internal/metrics"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/anthropic"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/gemini"
@@ -37,6 +38,7 @@ type serverState struct {
 	limiter  *ratelimit.Registry
 	adminKey string
 	cache    *server.RespCache
+	metrics  *metrics.Registry
 }
 
 func buildState(cfg *config.Config) (*serverState, error) {
@@ -92,7 +94,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 	}
 	prices := make(map[string]usage.Price, len(cfg.Prices))
 	for m, pc := range cfg.Prices {
-		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M}
+		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens}
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
@@ -110,6 +112,19 @@ func buildState(cfg *config.Config) (*serverState, error) {
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
 func openDB(path string) (*sql.DB, error) {
 	return usage.OpenDB(path)
+}
+
+// bindMetrics points the registry's circuit gauge at the live router.
+// Called again on reload so the gauge follows the swapped router.
+func bindMetrics(m *metrics.Registry, rt *router.Router) {
+	m.Providers = func() []string {
+		names := []string{}
+		for _, p := range rt.Providers() {
+			names = append(names, p.Name())
+		}
+		return names
+	}
+	m.CircuitOpen = func(name string) bool { return rt.CircuitState(name) == "open" }
 }
 
 func main() {
@@ -150,6 +165,9 @@ func main() {
 	state.limiter = ratelimit.NewRegistry()
 	state.adminKey = cfg.AdminKey
 	state.cache = server.NewCache(cfg.Cache.Enabled, cfg.Cache.TTLSeconds)
+	mreg := metrics.New()
+	state.metrics = mreg
+	bindMetrics(mreg, state.router)
 	var current atomic.Pointer[serverState]
 	current.Store(state)
 
@@ -166,6 +184,7 @@ func main() {
 			Router: st.router, Usage: st.usage, Prices: st.prices,
 			Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
 			Cache:         st.cache,
+			Metrics:       st.metrics,
 			SeparateAdmin: cfg.AdminListen != "",
 		}).ServeHTTP(w, r)
 	})
@@ -181,6 +200,7 @@ func main() {
 			server.NewAdminOnly(server.Options{
 				Router: st.router, Usage: st.usage, Prices: st.prices,
 				Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
+				Metrics: st.metrics,
 			}).ServeHTTP(w, r)
 		})
 		adminSrv = &http.Server{Addr: adminAddr, Handler: adminHandler}
@@ -218,6 +238,8 @@ func main() {
 				nstate.keys = prev.keys
 				nstate.limiter = prev.limiter
 				nstate.adminKey = ncfg.AdminKey
+				nstate.metrics = prev.metrics
+				bindMetrics(prev.metrics, nstate.router)
 				// Keep the warm cache unless reload toggled it off or changed TTL.
 				nstate.cache = prev.cache
 				if !ncfg.Cache.Enabled {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,8 @@ type Key struct {
 	TPM           int        `json:"tpm"`          // tokens/min; 0 = unlimited
 	QuotaTokens   int64      `json:"quota_tokens"` // lifetime cap; 0 = unlimited
 	SpentTokens   int64      `json:"spent_tokens"`
+	BudgetUSD     float64    `json:"budget_usd"` // lifetime USD cap; 0 = unlimited
+	SpentUSD      float64    `json:"spent_usd"`
 	AllowedModels []string   `json:"allowed_models"` // empty = all
 	ExpiresAt     *time.Time `json:"expires_at"`
 	Enabled       bool       `json:"enabled"`
@@ -55,7 +58,31 @@ func NewStore(db *sql.DB) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("create api_keys table: %w", err)
 	}
+	// Batch 4 columns; add only when missing (existing DBs).
+	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0"} {
+		name := strings.SplitN(col, " ", 2)[0]
+		if !hasColumn(db, "api_keys", name) {
+			if _, err := db.Exec(`ALTER TABLE api_keys ADD COLUMN ` + col); err != nil {
+				return nil, fmt.Errorf("migrate api_keys: %w", err)
+			}
+		}
+	}
 	return &Store{db: db}, nil
+}
+
+func hasColumn(db *sql.DB, table, col string) bool {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err == nil && n == col {
+			return true
+		}
+	}
+	return false
 }
 
 // Create inserts a key, generating the key string when empty.
@@ -73,9 +100,9 @@ func (s *Store) Create(k Key) (Key, error) {
 	}
 	k.CreatedAt = time.Now().UTC()
 	res, err := s.db.Exec(`INSERT INTO api_keys
-		(key, name, rpm, tpm, quota_tokens, spent_tokens, allowed_models, expires_at, enabled, created_at)
-		VALUES (?,?,?,?,?,0,?,?,?,?)`,
-		k.Key, k.Name, k.RPM, k.TPM, k.QuotaTokens, string(models), expires, boolInt(k.Enabled),
+		(key, name, rpm, tpm, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, expires_at, enabled, created_at)
+		VALUES (?,?,?,?,?,0,?,0,?,?,?,?)`,
+		k.Key, k.Name, k.RPM, k.TPM, k.QuotaTokens, k.BudgetUSD, string(models), expires, boolInt(k.Enabled),
 		k.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return Key{}, err
@@ -87,6 +114,7 @@ func (s *Store) Create(k Key) (Key, error) {
 // GetByKey returns the key row or (nil, nil) when unknown.
 func (s *Store) GetByKey(key string) (*Key, error) {
 	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
+		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, expires_at, enabled, created_at FROM api_keys WHERE key = ?`, key)
 	if err != nil {
 		return nil, err
@@ -105,6 +133,7 @@ func (s *Store) GetByKey(key string) (*Key, error) {
 // List returns all keys, newest first.
 func (s *Store) List() ([]Key, error) {
 	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
+		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, expires_at, enabled, created_at FROM api_keys ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -127,7 +156,7 @@ func scanKey(rows *sql.Rows) (Key, error) {
 	var expires sql.NullString
 	var enabled int
 	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.QuotaTokens,
-		&k.SpentTokens, &models, &expires, &enabled, &created); err != nil {
+		&k.SpentTokens, &k.BudgetUSD, &k.SpentUSD, &models, &expires, &enabled, &created); err != nil {
 		return Key{}, err
 	}
 	_ = json.Unmarshal([]byte(models), &k.AllowedModels)
@@ -156,6 +185,12 @@ func (s *Store) Delete(id int64) error {
 // SpendTokens adds n to the key's spent_tokens counter.
 func (s *Store) SpendTokens(id int64, n int) error {
 	_, err := s.db.Exec(`UPDATE api_keys SET spent_tokens = spent_tokens + ? WHERE id = ?`, n, id)
+	return err
+}
+
+// SpendUSD adds amount to the key's spent_usd counter.
+func (s *Store) SpendUSD(id int64, amount float64) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET spent_usd = spent_usd + ? WHERE id = ?`, amount, id)
 	return err
 }
 

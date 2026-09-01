@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
+	"github.com/Jarvisagentic/tokenroute/internal/metrics"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/ratelimit"
 	"github.com/Jarvisagentic/tokenroute/internal/router"
@@ -24,6 +26,31 @@ import (
 )
 
 const maxBody = 10 << 20 // 10MB
+
+// errContextExceeded marks a candidate skipped by the context-window guard.
+var errContextExceeded = errors.New("prompt exceeds model context window")
+
+// estimateChatTokens approximates prompt tokens as len(messages JSON)/4.
+func estimateChatTokens(body []byte) int {
+	var parsed struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Messages) == 0 {
+		return len(body) / 4
+	}
+	return len(parsed.Messages) / 4
+}
+
+// estimateEmbedTokens approximates prompt tokens as len(input)/4 (chars).
+func estimateEmbedTokens(body []byte) int {
+	var parsed struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Input) == 0 {
+		return len(body) / 4
+	}
+	return len(parsed.Input) / 4
+}
 
 type ctxKey int
 
@@ -39,6 +66,8 @@ type Options struct {
 	AdminKey string // empty = /admin disabled (503)
 	// Cache enables the in-memory response cache when non-nil.
 	Cache *RespCache
+	// Metrics collects Prometheus counters; nil disables /metrics.
+	Metrics *metrics.Registry
 	// SeparateAdmin, when true, removes /admin routes from this handler —
 	// they are served by NewAdminOnly on a dedicated listener.
 	SeparateAdmin bool
@@ -51,11 +80,15 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
-		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache}
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
+	if s.metrics != nil {
+		mux.Get("/metrics", s.metricsHandler)
+	}
 	mux.Group(func(r chi.Router) {
 		r.Use(s.requireKey)
+		r.Use(timeoutOverride)
 		r.Post("/v1/chat/completions", s.chatCompletions)
 		r.Post("/v1/embeddings", s.embeddings)
 		r.Get("/v1/models", s.models)
@@ -70,9 +103,12 @@ func NewWithOptions(o Options) http.Handler {
 // NewAdminOnly serves only /admin routes (dedicated admin listener).
 func NewAdminOnly(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
-		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey}
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, metrics: o.Metrics}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
+	if s.metrics != nil {
+		mux.Get("/metrics", s.metricsHandler)
+	}
 	s.registerAdmin(mux)
 	return mux
 }
@@ -102,6 +138,26 @@ type srv struct {
 	limiter  *ratelimit.Registry
 	adminKey string
 	cache    *RespCache
+	metrics  *metrics.Registry
+}
+
+// metricsHandler serves GET /metrics (Prometheus text exposition, no auth).
+func (s *srv) metricsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	s.metrics.Write(w)
+}
+
+// recordMetrics counts the completed request; nil-safe.
+func (s *srv) recordMetrics(e usage.Entry) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.RecordRequest(e.KeyName, e.Provider, e.Model, e.Status, float64(e.LatencyMs)/1000)
+	s.metrics.RecordTokens(e.KeyName, e.Provider, "prompt", e.PromptTokens)
+	s.metrics.RecordTokens(e.KeyName, e.Provider, "completion", e.CompletionTokens)
+	if e.Cached {
+		s.metrics.RecordCacheHit()
+	}
 }
 
 // requireKey validates "Authorization: Bearer gw-..." when auth is enabled.
@@ -127,6 +183,32 @@ func (s *srv) requireKey(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxAPIKey, k)))
+	})
+}
+
+// maxTimeoutMs caps the X-Timeout-Ms per-request override.
+const maxTimeoutMs = 600000
+
+// timeoutOverride applies X-Timeout-Ms (int ms, capped at 600000) as a
+// per-request context timeout; invalid/absent values are ignored.
+func timeoutOverride(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := r.Header.Get("X-Timeout-Ms")
+		if v == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if n > maxTimeoutMs {
+			n = maxTimeoutMs
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(n)*time.Millisecond)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -199,6 +281,10 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			writeErr(w, http.StatusForbidden, "token quota exceeded", "quota_exceeded")
 			return nil, "", nil, nil, "", false
 		}
+		if k.BudgetUSD > 0 && k.SpentUSD >= k.BudgetUSD {
+			writeErr(w, http.StatusPaymentRequired, "USD budget exhausted", "budget_exceeded")
+			return nil, "", nil, nil, "", false
+		}
 		if s.limiter != nil {
 			if !s.limiter.AllowRPM(k.ID, k.RPM) {
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
@@ -232,8 +318,21 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 // all failed), the last retryable upstream response (buffered), and the last
 // transport error.
 func (s *srv) failover(ctx context.Context, hdr http.Header, body []byte, candidates []router.Candidate, call callFn) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
+	return s.failoverCtx(ctx, hdr, body, candidates, call, 0)
+}
+
+// failoverCtx is failover plus a prompt-token estimate for the context-window
+// guard (0 = skip the guard). Candidates whose priced context window is
+// smaller than the estimate are skipped without an upstream call.
+func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, candidates []router.Candidate, call callFn, estTokens int) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
 	for _, c := range candidates {
 		cand = c
+		if estTokens > 0 {
+			if p, ok := s.prices[c.Model]; ok && p.ContextTokens > 0 && estTokens > p.ContextTokens {
+				lastErr = errContextExceeded // local rejection; try next candidate
+				continue
+			}
+		}
 		attemptStart := time.Now()
 		req := &provider.Request{Model: c.Model, Body: body, Header: hdr}
 		att, err := call(ctx, c.Provider, req)
@@ -364,15 +463,21 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastFailResp *http.Response
 	var attempts int
 	fused := false
+	est := estimateChatTokens(body)
 	if strategy == router.StrategyFusion && !stream && len(candidates) > 1 {
 		cand, resp, lastFailResp, lastErr, attempts = s.fusionRun(r.Context(), hdr, body, candidates[:2])
 		fused = true
 	} else {
-		cand, resp, lastFailResp, lastErr, attempts = s.failover(r.Context(), hdr, body, candidates, chatCall)
+		cand, resp, lastFailResp, lastErr, attempts = s.failoverCtx(r.Context(), hdr, body, candidates, chatCall, est)
 	}
 	setDecisionHeader(w, cand, strategy, attempts)
 	if fused {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")
+	}
+	if resp == nil && lastFailResp == nil && errors.Is(lastErr, errContextExceeded) {
+		// Every candidate rejected locally by the context-window guard.
+		writeErr(w, http.StatusBadRequest, errContextExceeded.Error(), "context_length_exceeded")
+		return
 	}
 	if resp == nil {
 		entry := usage.Entry{
@@ -416,6 +521,11 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			slog.Error("spend tokens", "err", err, "key_id", k.ID)
 		}
 	}
+	if k != nil && entry.CostUSD != nil && *entry.CostUSD > 0 {
+		if err := s.keys.SpendUSD(k.ID, *entry.CostUSD); err != nil {
+			slog.Error("spend usd", "err", err, "key_id", k.ID)
+		}
+	}
 	if ck != "" && respBody != nil && entry.Status == http.StatusOK && entry.TotalTokens > 0 {
 		s.cache.store(ck, &cacheEntry{
 			body: respBody, status: entry.Status,
@@ -441,8 +551,12 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	cand, resp, lastFailResp, lastErr, attempts := s.failover(r.Context(), filterHeaders(r.Header), body, candidates, embedCall)
+	cand, resp, lastFailResp, lastErr, attempts := s.failoverCtx(r.Context(), filterHeaders(r.Header), body, candidates, embedCall, estimateEmbedTokens(body))
 	setDecisionHeader(w, cand, strategy, attempts)
+	if resp == nil && lastFailResp == nil && errors.Is(lastErr, errContextExceeded) {
+		writeErr(w, http.StatusBadRequest, errContextExceeded.Error(), "context_length_exceeded")
+		return
+	}
 	if resp == nil {
 		entry := usage.Entry{
 			RequestID: reqID, TS: start, VirtualModel: model,
@@ -477,6 +591,11 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.keys.SpendTokens(k.ID, entry.TotalTokens); err != nil {
 			slog.Error("spend tokens", "err", err, "key_id", k.ID)
+		}
+	}
+	if k != nil && entry.CostUSD != nil && *entry.CostUSD > 0 {
+		if err := s.keys.SpendUSD(k.ID, *entry.CostUSD); err != nil {
+			slog.Error("spend usd", "err", err, "key_id", k.ID)
 		}
 	}
 	s.logEntry(r.Context(), entry)
@@ -547,6 +666,7 @@ func retryableStatus(code int) bool {
 }
 
 func (s *srv) logEntry(ctx context.Context, e usage.Entry) {
+	s.recordMetrics(e)
 	if s.usage != nil {
 		if err := s.usage.Log(ctx, e); err != nil {
 			slog.Error("usage log", "err", err, "request_id", e.RequestID)
@@ -676,7 +796,8 @@ func filterHeaders(h http.Header) http.Header {
 		switch http.CanonicalHeaderKey(k) {
 		case "Authorization", "Content-Length", "Content-Type", "Connection",
 			"Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te",
-			"Trailer", "Transfer-Encoding", "Upgrade", "Host":
+			"Trailer", "Transfer-Encoding", "Upgrade", "Host",
+			"X-Timeout-Ms", "X-Max-Cost-Usd": // gateway-local controls
 			continue
 		}
 		out[k] = append([]string(nil), vs...)
