@@ -36,6 +36,11 @@ type ProviderConfig struct {
 	// applied after route resolution (alias -> upstream model).
 	ModelMapping map[string]string `yaml:"model_mapping"`
 	Circuit      *CircuitConfig    `yaml:"circuit"`
+	// QuotaTokenLimit + QuotaWindowSeconds enable pre-request budget
+	// awareness for this provider (per candidate model): strategies
+	// reset_aware/fill_first/auto read the ledger; 0 = untracked.
+	QuotaTokenLimit    int64 `yaml:"quota_token_limit"`
+	QuotaWindowSeconds int   `yaml:"quota_window_seconds"` // default 60
 }
 
 type CandidateConfig struct {
@@ -50,6 +55,14 @@ type RouteConfig struct {
 	Strategy   string            `yaml:"strategy"`   // priority|round_robin|least_latency|weighted|cost|lkgp|headroom
 	Multiplier float64           `yaml:"multiplier"` // cost multiplier; default 1.0
 	Candidates []CandidateConfig `yaml:"candidates"`
+}
+
+// FreeTierConfig is one free-tier budget entry: provider+model gets
+// monthly_tokens per 30-day window (0 = skip).
+type FreeTierConfig struct {
+	Provider      string `yaml:"provider"`
+	Model         string `yaml:"model"`
+	MonthlyTokens int64  `yaml:"monthly_tokens"`
 }
 
 type PriceConfig struct {
@@ -82,11 +95,24 @@ type Config struct {
 	// ModelCatalog controls daily models.dev capability sync: "off"
 	// disables; empty/other enables with the cache beside usage_db.
 	ModelCatalog string `yaml:"model_catalog"`
+	// PricingSync controls the LiteLLM pricing sync: "off" disables;
+	// empty/other enables with a 24h refresh. Synced prices fill gaps only —
+	// config `prices:` entries always win (OmniRoute resolution order).
+	PricingSync string `yaml:"pricing_sync"`
 	// Search lists web-search backends for POST /v1/search, tried in order.
 	Search    []SearchConfig         `yaml:"search"`
 	Providers []ProviderConfig       `yaml:"providers"`
 	Routes    []RouteConfig          `yaml:"routes"`
 	Prices    map[string]PriceConfig `yaml:"prices"`
+	// FreeTier catalogs per (provider, model) monthly free-token budgets
+	// (OmniRoute freeModelCatalog): seeds the quota ledger with monthly
+	// windows so fill_first/reset_aware/auto prefer live free tiers.
+	FreeTier []FreeTierConfig `yaml:"free_tier"`
+	// Aliases maps client-facing model names to route (virtual) models,
+	// resolved BEFORE route lookup (OmniRoute modelAliasResolver):
+	// "deepseek-chat" -> "ds/deepseek-v4-flash". Per-provider model_mapping
+	// still applies after route resolution.
+	Aliases map[string]string `yaml:"aliases"`
 }
 
 func Load(path string) (*Config, error) {
@@ -169,7 +195,8 @@ func (c *Config) Validate() error {
 // validStrategy mirrors router strategy names; kept local to avoid an import.
 func validStrategy(s string) bool {
 	switch s {
-	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion":
+	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion",
+		"p2c", "reset_aware", "fill_first", "auto":
 		return true
 	}
 	return false

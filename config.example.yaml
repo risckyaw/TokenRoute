@@ -73,9 +73,22 @@ providers:
 
 routes:
   # Virtual model names clients use in "model" field.
-  # strategy: priority (default) | round_robin | least_latency | weighted | cost | lkgp | headroom
+  # strategy: priority (default) | round_robin | least_latency | weighted | cost |
+  #           lkgp | headroom | fusion | p2c | reset_aware | fill_first | auto
+  # p2c:         power-of-2-choices — 2 random candidates, least-loaded first.
+  # reset_aware: candidates whose quota window resets soonest first.
+  # fill_first:  keep priority order; sink quota-exhausted candidates (pairs
+  #              with free_tier: maximize one free tier before the next).
+  # auto:        composite score = health × latency × cost × quota headroom
+  #              (a single zero factor disqualifies; OmniRoute port).
   # Failover: retryable statuses (429/500/502/503/504) and transport errors
   # fall through to the next candidate; other statuses are relayed as-is.
+  # A 429 whose body signals exhausted balance ("insufficient balance",
+  # "credits exhausted") locks that provider+model for 15 minutes instead of
+  # the short rate-limit cooldown — quota exhaustion is not a rate limit.
+  # Client aborts (disconnect mid-stream) never trip circuit breakers.
+  # Breakers gain a DEGRADED warning band at 60% of threshold (threshold>=4),
+  # and the open cooldown doubles after 3 failed probe cycles (16x cap).
   - model: auto
     strategy: priority              # first candidate by priority; failover on retryable errors
     # multiplier scales the logged USD cost for this route (default 1.0).
@@ -133,6 +146,32 @@ routes:
 
   - model: smart
     candidates:                     # no strategy -> priority
+
+# ── New: pricing sync, free-tier catalog, aliases, quota ──────────────
+
+# LiteLLM community pricing sync (default on; "off" disables). Synced prices
+# fill gaps only — prices: entries above always win. Refreshes every 24h.
+#pricing_sync: "off"
+
+# Free-tier budget catalog: seeds monthly quota windows per provider+model so
+# fill_first/reset_aware/auto prefer candidates with live free budget, and
+# quota_exhausted lockouts stop hot-looping a spent free tier.
+#free_tier:
+#  - {provider: gemini, model: gemini-2.5-flash, monthly_tokens: 60000000}
+#  - {provider: mistral, model: mistral-small-latest, monthly_tokens: 1000000000}
+
+# Global client-name aliases, resolved before route lookup (the body model is
+# rewritten). Per-provider model_mapping still applies after route resolution.
+#aliases:
+#  deepseek-chat: auto            # client asks "deepseek-chat" -> route "auto"
+
+# Per-provider token budget windows (pre-request awareness): strategies
+# reset_aware/fill_first/auto read this ledger; quota_token_limit: 0 (default)
+# = untracked. Actual usage is recorded after each response.
+#providers:
+#  - name: deepseek
+#    quota_token_limit: 5000000     # tokens per window
+#    quota_window_seconds: 86400    # window length (default 60)
       - provider: openai
         model: gpt-4o
 

@@ -14,7 +14,25 @@ speak one API.
 - **Routing strategies** — priority, round_robin, least_latency, weighted,
   cost, lkgp (last-known-good provider), headroom (fewest requests in the
   last 60s first), fusion (race first two candidates, fastest/cheapest 200
-  wins), per virtual model.
+  wins), p2c (power-of-2-choices), reset_aware (quota window resetting
+  soonest first), fill_first (exhaust one candidate's quota before the
+  next), auto (composite score: health × latency × cost × quota headroom) —
+  per virtual model.
+- **Failure classification** — 429s carrying balance/credit wording are
+  quota_exhausted (15min model lock), not rate limits; 401/403 open the
+  circuit immediately; client aborts never count as provider failures.
+- **Escalating circuit breakers** — DEGRADED warning band at 60% of
+  threshold (threshold ≥ 4); open cooldown doubles after 3 failed probe
+  cycles (16x cap).
+- **Provider quota ledger** — optional `quota_token_limit` per provider:
+  pre-request budget windows (actual usage recorded post-response) read by
+  reset_aware/fill_first/auto.
+- **Free-tier catalog** — `free_tier:` entries seed monthly token budgets
+  into the quota ledger so quota-aware strategies prefer live free tiers.
+- **Pricing sync** — LiteLLM community catalog fills price gaps every 24h
+  (`pricing_sync: "off"` disables); config `prices:` always win.
+- **Global model aliases** — `aliases:` map client-facing names to virtual
+  route models, resolved before route lookup (body model rewritten).
 - **Response cache** — optional in-memory cache for non-stream chat
   completions (`cache:` config block); hits return `X-TokenRoute-Cache: HIT`
   with zero cost, tracked in the usage log.

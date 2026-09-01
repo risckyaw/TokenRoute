@@ -21,14 +21,19 @@ const (
 	StrategyCost         = "cost"
 	StrategyLKGP         = "lkgp" // last-known-good provider first
 	StrategyHeadroom     = "headroom"
-	StrategyFusion       = "fusion" // race first 2 candidates concurrently
+	StrategyFusion       = "fusion"      // race first 2 candidates concurrently
+	StrategyP2C          = "p2c"         // power-of-2-choices: pick 2 random, least-loaded wins
+	StrategyResetAware   = "reset_aware" // prefer candidates whose quota window resets soonest
+	StrategyFillFirst    = "fill_first"  // exhaust first candidate's quota before moving on
+	StrategyAuto         = "auto"        // composite multi-factor scoring (OmniRoute port)
 )
 
 // ValidStrategy reports whether s is a known strategy name.
 func ValidStrategy(s string) bool {
 	switch s {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
-		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion:
+		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
+		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto:
 		return true
 	}
 	return false
@@ -68,12 +73,16 @@ type Router struct {
 	byName    map[string]provider.Provider
 	circuits  map[string]*CircuitBreaker
 	latency   map[string]float64 // EMA latency ms per provider name
+	errRate   map[string]float64 // EMA error rate 0..1 per provider name
 	prices    map[string]usage.Price
 	mappings  map[string]map[string]string // provider name -> alias -> upstream model
+	priceMu   sync.RWMutex                 // guards prices
 	latMu     sync.Mutex
 	lockMu    sync.Mutex
 	modelLock map[string]time.Time // provider|model -> locked until
 	windows   map[string]*window   // provider name -> 60s tumbling counters
+	quota     *QuotaLedger         // pre-request budget awareness (nil-safe)
+	aliases   map[string]string    // client model name -> virtual route model
 }
 
 func New(providers []provider.Provider, routes []*Route) *Router {
@@ -89,8 +98,10 @@ func New(providers []provider.Provider, routes []*Route) *Router {
 		byName:    byName,
 		circuits:  map[string]*CircuitBreaker{},
 		latency:   map[string]float64{},
+		errRate:   map[string]float64{},
 		modelLock: map[string]time.Time{},
 		windows:   map[string]*window{},
+		quota:     NewQuotaLedger(),
 	}
 	for _, rt := range routes {
 		if rt.Strategy == "" {
@@ -117,9 +128,36 @@ func (r *Router) SetCircuit(providerName string, cfg CircuitConfig) {
 	r.circuits[providerName] = NewCircuitBreaker(cfg)
 }
 
-// SetPrices installs the price map used by the cost strategy.
+// SetAliases installs the global client-name -> virtual-model alias map
+// (resolved before route lookup).
+func (r *Router) SetAliases(aliases map[string]string) {
+	r.aliases = aliases
+}
+
+// ResolveAlias maps a client-facing model name to its virtual route model
+// (identity when unaliased).
+func (r *Router) ResolveAlias(model string) string {
+	if r.aliases != nil {
+		if target, ok := r.aliases[model]; ok && target != "" {
+			return target
+		}
+	}
+	return model
+}
+
+// SetPrices installs the price map used by the cost and auto strategies.
 func (r *Router) SetPrices(prices map[string]usage.Price) {
+	r.priceMu.Lock()
 	r.prices = prices
+	r.priceMu.Unlock()
+}
+
+// price returns a model's price (RLock; pricing sync may swap the map).
+func (r *Router) price(model string) (usage.Price, bool) {
+	r.priceMu.RLock()
+	defer r.priceMu.RUnlock()
+	p, ok := r.prices[model]
+	return p, ok
 }
 
 // SetModelMapping installs a provider's alias -> upstream-model map
@@ -269,13 +307,145 @@ func (r *Router) OrderCandidates(rt *Route) []Candidate {
 		sort.SliceStable(allowed, func(i, j int) bool {
 			return counts[allowed[i].Provider.Name()] < counts[allowed[j].Provider.Name()]
 		})
+	case StrategyP2C:
+		// Power-of-2-choices (OmniRoute p2c): draw two distinct candidates at
+		// random, put the least-loaded first, keep the rest in priority order.
+		if len(allowed) > 1 {
+			r.latMu.Lock()
+			counts := make(map[string]int, len(r.windows))
+			for name, w := range r.windows {
+				counts[name] = w.reqs
+			}
+			r.latMu.Unlock()
+			rt.mu.Lock()
+			if rt.randSrc == nil {
+				rt.randSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
+			}
+			i := rt.randSrc.Intn(len(allowed))
+			j := rt.randSrc.Intn(len(allowed) - 1)
+			if j >= i {
+				j++
+			}
+			rt.mu.Unlock()
+			winner, loser := allowed[i], allowed[j]
+			if counts[loser.Provider.Name()] < counts[winner.Provider.Name()] {
+				winner, loser = loser, winner
+			}
+			rest := make([]Candidate, 0, len(allowed)-1)
+			for k, c := range allowed {
+				if k != i && k != j {
+					rest = append(rest, c)
+				}
+			}
+			allowed = append([]Candidate{winner, loser}, rest...)
+		}
+	case StrategyResetAware:
+		// Prefer candidates whose quota window resets soonest; unknown quota
+		// sorts last (no signal). Ties keep priority order.
+		sort.SliceStable(allowed, func(i, j int) bool {
+			ri := r.quota.WindowReset(allowed[i].Provider.Name(), allowed[i].Model)
+			rj := r.quota.WindowReset(allowed[j].Provider.Name(), allowed[j].Model)
+			if ri.IsZero() && rj.IsZero() {
+				return false
+			}
+			if ri.IsZero() {
+				return false
+			}
+			if rj.IsZero() {
+				return true
+			}
+			return ri.Before(rj)
+		})
+	case StrategyFillFirst:
+		// Keep priority order but sink candidates whose quota window is
+		// exhausted (remaining <= 0) behind those with budget left — the first
+		// candidate keeps serving until its quota runs out (OmniRoute
+		// fill-first: maximize one free tier before touching the next).
+		sort.SliceStable(allowed, func(i, j int) bool {
+			_, ri, ki := r.quota.Remaining(allowed[i].Provider.Name(), allowed[i].Model)
+			_, rj, kj := r.quota.Remaining(allowed[j].Provider.Name(), allowed[j].Model)
+			ei := ki && ri <= 0
+			ej := kj && rj <= 0
+			if ei == ej {
+				return false
+			}
+			return !ei // non-exhausted first
+		})
+	case StrategyAuto:
+		// Composite multi-factor score, ported from OmniRoute
+		// adaptiveRouting.ts: product of clamped 0..1 factors so a single
+		// zero disqualifies. Factors: health (1 - errRate), latency, cost,
+		// quota headroom. Circuit open / model lock already filtered above.
+		r.latMu.Lock()
+		lat := make(map[string]float64, len(r.latency))
+		for k, v := range r.latency {
+			lat[k] = v
+		}
+		errs := make(map[string]float64, len(r.errRate))
+		for k, v := range r.errRate {
+			errs[k] = v
+		}
+		r.latMu.Unlock()
+		type scored struct {
+			c     Candidate
+			score float64
+		}
+		scores := make([]scored, 0, len(allowed))
+		for _, c := range allowed {
+			name := c.Provider.Name()
+			health := 1 - clamp01(errs[name])
+			latencyF := 1.0
+			if l, ok := lat[name]; ok && l > 0 {
+				latencyF = 1 - minF(l/50_000, 0.6) // 50s+ -> floor 0.4
+			}
+			costF := 1.0
+			if p, ok := r.price(c.Model); ok {
+				// $10/1M combined -> 0. Cheapest providers win.
+				costF = 1 - clamp01((p.PromptPer1M+p.CompletionPer1M)/10)
+			}
+			quotaF := 1.0
+			if _, ratio, known := r.quota.Remaining(name, c.Model); known {
+				quotaF = clamp01(ratio * 1.3) // full budget -> 1.0; ~23% left -> 0.3
+				if ratio <= 0 {
+					quotaF = 0
+				}
+			}
+			score := health * latencyF * costF * quotaF
+			scores = append(scores, scored{c, score})
+		}
+		sort.SliceStable(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
+		for i := range scores {
+			allowed[i] = scores[i].c
+		}
 	}
 	return allowed
 }
 
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func minF(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Quota returns the router's quota ledger (never nil).
+func (r *Router) Quota() *QuotaLedger {
+	return r.quota
+}
+
 // costKey sorts by prompt+completion price asc; unknown price = last.
 func (r *Router) costKey(c Candidate) float64 {
-	if p, ok := r.prices[c.Model]; ok {
+	if p, ok := r.price(c.Model); ok {
 		return p.PromptPer1M + p.CompletionPer1M
 	}
 	return 1e18
@@ -285,6 +455,13 @@ func (r *Router) costKey(c Candidate) float64 {
 // routes) the last-known-good provider. Called by the server after each
 // attempt.
 func (r *Router) RecordResult(providerName string, latency time.Duration, success bool) {
+	r.RecordResultKind(providerName, latency, success, FailureUnknown, true)
+}
+
+// RecordResultKind is RecordResult with a classified failure; kinds that are
+// not genuine provider failures (client aborts — countsAgainstProvider=false)
+// skip the circuit breaker while still recording latency for observability.
+func (r *Router) RecordResultKind(providerName string, latency time.Duration, success bool, kind FailureKind, countsAgainstProvider bool) {
 	r.latMu.Lock()
 	cur := r.latency[providerName]
 	if cur == 0 {
@@ -293,6 +470,11 @@ func (r *Router) RecordResult(providerName string, latency time.Duration, succes
 		cur = emaAlpha*float64(latency.Milliseconds()) + (1-emaAlpha)*cur
 	}
 	r.latency[providerName] = cur
+	if success {
+		r.errRate[providerName] = (1 - emaAlpha) * r.errRate[providerName]
+	} else if countsAgainstProvider {
+		r.errRate[providerName] = emaAlpha + (1-emaAlpha)*r.errRate[providerName]
+	}
 	w := r.windows[providerName]
 	if w == nil {
 		w = &window{}
@@ -308,7 +490,7 @@ func (r *Router) RecordResult(providerName string, latency time.Duration, succes
 		if success {
 			cb.OnSuccess()
 		} else {
-			cb.OnFailure()
+			cb.OnFailureKind(kind, countsAgainstProvider)
 		}
 	}
 	for _, rt := range r.routes {

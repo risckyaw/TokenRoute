@@ -21,6 +21,7 @@ import (
 	"github.com/Jarvisagentic/tokenroute/internal/catalog"
 	"github.com/Jarvisagentic/tokenroute/internal/config"
 	"github.com/Jarvisagentic/tokenroute/internal/metrics"
+	"github.com/Jarvisagentic/tokenroute/internal/pricing"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/anthropic"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/gemini"
@@ -50,7 +51,10 @@ type serverState struct {
 	searchBackends []search.Backend
 }
 
-func buildState(cfg *config.Config) (*serverState, error) {
+// buildState builds a fresh server state. sharedPrices nil (startup) creates
+// a new map; non-nil (reload) reuses it so background syncers (model catalog,
+// LiteLLM pricing) keep writing the map the router and server read.
+func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serverState, error) {
 	provs := make([]provider.Provider, 0, len(cfg.Providers))
 	byName := map[string]provider.Provider{}
 	sit := map[string]int{} // stream idle timeout ms per provider name
@@ -119,12 +123,21 @@ func buildState(cfg *config.Config) (*serverState, error) {
 		}
 		routes = append(routes, rt)
 	}
-	prices := make(map[string]usage.Price, len(cfg.Prices))
+	prices := sharedPrices
+	if prices == nil {
+		prices = make(map[string]usage.Price, len(cfg.Prices))
+	}
+	// Overlay config prices on the shared map: config always wins over
+	// synced entries (OmniRoute resolution order). Config entries removed
+	// from YAML linger until restart — acceptable last-good semantics.
 	for m, pc := range cfg.Prices {
 		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens}
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
+	if len(cfg.Aliases) > 0 {
+		rt.SetAliases(cfg.Aliases)
+	}
 	for name, m := range mappings {
 		rt.SetModelMapping(name, m)
 	}
@@ -135,6 +148,27 @@ func buildState(cfg *config.Config) (*serverState, error) {
 				CooldownMs:       pc.Circuit.CooldownMs,
 				AutoDisableAfter: pc.Circuit.AutoDisableAfter,
 			})
+		}
+		if pc.QuotaTokenLimit > 0 {
+			win := time.Duration(pc.QuotaWindowSeconds) * time.Second
+			if win <= 0 {
+				win = time.Minute
+			}
+			// One ledger entry per candidate model routed to this provider.
+			for _, rc := range cfg.Routes {
+				for _, cc := range rc.Candidates {
+					if cc.Provider == pc.Name {
+						rt.Quota().SetLimit(pc.Name, cc.Model, pc.QuotaTokenLimit, win)
+					}
+				}
+			}
+		}
+	}
+	// Free-tier catalog: seed the quota ledger with 30-day windows so
+	// quota-aware strategies prefer candidates with live free budget.
+	for _, ft := range cfg.FreeTier {
+		if ft.MonthlyTokens > 0 && ft.Provider != "" && ft.Model != "" {
+			rt.Quota().SetLimit(ft.Provider, ft.Model, ft.MonthlyTokens, 30*24*time.Hour)
 		}
 	}
 	backends := make([]search.Backend, 0, len(cfg.Search))
@@ -193,7 +227,7 @@ func main() {
 		log.Error("load config", "err", err)
 		os.Exit(1)
 	}
-	state, err := buildState(cfg)
+	state, err := buildState(cfg, nil)
 	if err != nil {
 		log.Error("build state", "err", err)
 		os.Exit(1)
@@ -226,6 +260,12 @@ func main() {
 			"", 0, state.prices,
 		)
 		go syncer.Run(context.Background())
+	}
+
+	// LiteLLM pricing sync — fills price gaps, config always wins; "off" disables.
+	if !strings.EqualFold(cfg.PricingSync, "off") {
+		psync := pricing.NewSyncer(state.prices)
+		go psync.Run(context.Background(), 0)
 	}
 	var current atomic.Pointer[serverState]
 	current.Store(state)
@@ -291,7 +331,7 @@ func main() {
 					log.Error("reload config", "err", err)
 					continue
 				}
-				nstate, err := buildState(ncfg)
+				nstate, err := buildState(ncfg, current.Load().prices)
 				if err != nil {
 					log.Error("reload build state", "err", err)
 					continue

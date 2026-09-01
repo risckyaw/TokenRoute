@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -151,6 +152,7 @@ func (s *srv) registerAdmin(mux chi.Router) {
 type srv struct {
 	router   *router.Router
 	usage    *usage.Logger
+	priceMu  sync.RWMutex // guards prices (pricing sync swaps the map)
 	prices   map[string]usage.Price
 	keys     *auth.Store
 	limiter  *ratelimit.Registry
@@ -162,6 +164,21 @@ type srv struct {
 	maxBody      int64
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
+}
+
+// price returns the price for a model (RLock; pricing sync may swap the map).
+func (s *srv) price(model string) (usage.Price, bool) {
+	s.priceMu.RLock()
+	defer s.priceMu.RUnlock()
+	p, ok := s.prices[model]
+	return p, ok
+}
+
+// SetPrices swaps the price map (pricing sync; config reload).
+func (s *srv) SetPrices(prices map[string]usage.Price) {
+	s.priceMu.Lock()
+	s.prices = prices
+	s.priceMu.Unlock()
 }
 
 // maxBodyBytes converts MB to bytes; 0/negative -> 10MB default.
@@ -324,6 +341,17 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 		writeErr(w, http.StatusBadRequest, "missing or empty \"model\" field", "invalid_request_error")
 		return nil, "", nil, nil, "", 1, false
 	}
+	// Global alias resolution (client name -> virtual route model) before
+	// auth checks and route lookup, so allowlists see the canonical target.
+	if aliased := s.router.ResolveAlias(model); aliased != model {
+		model = aliased
+		// Rewrite the body so the provider call carries the resolved model;
+		// passthrough fidelity only applies to the model field anyway.
+		parsed["model"] = aliased
+		if raw, err := json.Marshal(parsed); err == nil {
+			body = raw
+		}
+	}
 
 	// Phase 4: per-key authorization, rate limits, quota.
 	k, _ = r.Context().Value(ctxAPIKey).(*auth.Key)
@@ -463,7 +491,7 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 		// upstream model.
 		cand.Model = s.router.MapModel(c.Provider.Name(), c.Model)
 		if estTokens > 0 {
-			if p, ok := s.prices[c.Model]; ok && p.ContextTokens > 0 && estTokens > p.ContextTokens {
+			if p, ok := s.price(c.Model); ok && p.ContextTokens > 0 && estTokens > p.ContextTokens {
 				lastErr = errContextExceeded // local rejection; try next candidate
 				continue
 			}
@@ -473,7 +501,11 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 		att, err := call(ctx, c.Provider, req)
 		attempts++
 		if err != nil {
-			s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
+			// Classify transport errors: client aborts must not count against
+			// the provider's circuit breaker (OmniRoute
+			// isLocalStreamLifecycleError).
+			f := router.ClassifyFailure(0, "", err)
+			s.router.RecordResultKind(c.Provider.Name(), time.Since(attemptStart), false, f.Kind, f.Kind != router.FailureUnknown)
 			lastErr = err
 			if lastFailResp != nil {
 				lastFailResp.Body.Close()
@@ -484,21 +516,27 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 		if retryableStatus(att.StatusCode) {
 			errBody, _ := io.ReadAll(io.LimitReader(att.Body, 64<<10))
 			att.Body.Close()
-			s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
+			f := router.ClassifyFailure(att.StatusCode, string(errBody), nil)
+			s.router.RecordResultKind(c.Provider.Name(), time.Since(attemptStart), false, f.Kind, true)
 			if att.StatusCode == http.StatusTooManyRequests {
 				// Quota-aware lock: honor the upstream-signalled reset
 				// (rate-limit headers, then Retry-After) so an exhausted
 				// model/key pair stays skipped exactly until its quota
 				// window resets instead of a flat blind cooldown.
 				lock := 30 * time.Second
+				if f.Kind == router.FailureQuotaExhausted {
+					// Balance/credit exhaustion is not a rate limit: its
+					// window is unknown, so lock long instead of hot-looping.
+					lock = router.QuotaExhaustedCooldown
+				}
 				if d := rateLimitReset(att.Header); d > 0 {
 					lock = d
 				} else if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 {
 					lock = d
 				}
 				s.router.LockModel(c.Provider.Name(), c.Model, lock)
-				// After RecordResult so the custom duration isn't clobbered.
-				if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 {
+				// After RecordResultKind so the custom duration isn't clobbered.
+				if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 && f.Kind != router.FailureQuotaExhausted {
 					s.router.OpenCircuitFor(c.Provider.Name(), d)
 				}
 			}
@@ -571,7 +609,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if mt, ok := parsed["max_tokens"].(float64); ok && mt > 0 {
 			maxTok = int(mt)
 		}
-		if p, ok := s.prices[candidates[0].Model]; ok {
+		if p, ok := s.price(candidates[0].Model); ok {
 			est := float64(maxTok) / 1e6 * (p.PromptPer1M + p.CompletionPer1M)
 			if est > budget {
 				writeErr(w, http.StatusPaymentRequired, "budget exceeded", "budget_exceeded")
@@ -664,7 +702,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	entry.LatencyMs = time.Since(start).Milliseconds()
 	entry.Multiplier = mult
-	if p, ok := s.prices[cand.Model]; ok {
+	if p, ok := s.price(cand.Model); ok {
 		entry.CostUSD = usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p)
 	}
 	if entry.CostUSD != nil && mult != 1 {
@@ -685,6 +723,11 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if err := s.keys.SpendUSD(k.ID, *entry.CostUSD); err != nil {
 			slog.Error("spend usd", "err", err, "key_id", k.ID)
 		}
+	}
+	// Quota ledger: record actual usage so pre-request strategies
+	// (reset_aware/fill_first/auto) see the remaining budget.
+	if entry.TotalTokens > 0 && entry.Provider != "" && entry.Provider != "cache" {
+		s.router.Quota().Record(entry.Provider, entry.Model, int64(entry.TotalTokens))
 	}
 	if ck != "" && respBody != nil && entry.Status == http.StatusOK && entry.TotalTokens > 0 {
 		s.cache.store(ck, &cacheEntry{
@@ -743,7 +786,7 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	entry.TotalTokens = entry.PromptTokens
 	entry.LatencyMs = time.Since(start).Milliseconds()
 	entry.Multiplier = mult
-	if p, ok := s.prices[cand.Model]; ok {
+	if p, ok := s.price(cand.Model); ok {
 		entry.CostUSD = usage.EmbedCost(entry.PromptTokens, &p)
 	}
 	if entry.CostUSD != nil && mult != 1 {
@@ -933,7 +976,7 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 		w.Header().Set("X-TokenRoute-Prompt-Tokens", strconv.Itoa(entry.PromptTokens))
 		w.Header().Set("X-TokenRoute-Completion-Tokens", strconv.Itoa(entry.CompletionTokens))
 		w.Header().Set("X-TokenRoute-Total-Tokens", strconv.Itoa(entry.TotalTokens))
-		if p, ok := s.prices[entry.Model]; ok {
+		if p, ok := s.price(entry.Model); ok {
 			if cost := usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p); cost != nil {
 				w.Header().Set("X-TokenRoute-Cost-USD", strconv.FormatFloat(*cost, 'f', -1, 64))
 			}

@@ -15,15 +15,20 @@ type CircuitConfig struct {
 }
 
 const (
-	stateClosed = iota
+	stateClosed   = iota
+	stateDegraded // early-warning band: traffic flows, dashboards warn
 	stateOpen
 	stateHalfOpen
 	stateDisabled
 )
 
 // CircuitBreaker is a per-provider state machine:
-// closed -> open after threshold consecutive failures; open for cooldown;
+// closed -> degraded at 60% of threshold (warning only) -> open at threshold;
+// open for an escalating cooldown (each failed probe cycle doubles it, 16x cap);
 // half-open allowing exactly 1 probe; probe success -> closed, failure -> open.
+// Failure-kind aware: auth/permission failures open immediately (no point
+// probing a bad key); client aborts never count (handled by ClassifyFailure
+// callers — OnFailureKind(FailureUnknown) is ignored).
 type CircuitBreaker struct {
 	mu             sync.Mutex
 	threshold      int
@@ -33,7 +38,9 @@ type CircuitBreaker struct {
 	failures       int
 	state          int
 	openedAt       time.Time
-	trips          int              // total open-transitions
+	trips          int // total open-transitions
+	openCycles     int // open->half_open->open cycles (backoff escalation)
+	lastKind       FailureKind
 	now            func() time.Time // injectable for tests
 }
 
@@ -55,22 +62,56 @@ func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
 	return &CircuitBreaker{threshold: threshold, cooldown: cooldown, autoDisable: autoDisable, now: time.Now}
 }
 
+// degradationThreshold is the failure count at which the breaker enters the
+// DEGRADED warning band: 60% of the open threshold. Only meaningful for
+// thresholds >= 4; smaller breakers skip the band (returns threshold, so the
+// degraded check never fires before open).
+func (c *CircuitBreaker) degradationThreshold() int {
+	if c.threshold < 4 {
+		return c.threshold
+	}
+	d := (c.threshold * 60) / 100
+	if d < 2 {
+		d = 2
+	}
+	if d >= c.threshold {
+		d = c.threshold - 1
+	}
+	return d
+}
+
+// effectiveCooldown escalates the base cooldown after repeated failed probe
+// cycles: 2^(cycles-3), capped at 16x (ported from OmniRoute
+// _effectiveResetTimeout — a provider that keeps failing probes backs off
+// instead of hot-looping every 30s).
+func (c *CircuitBreaker) effectiveCooldown() time.Duration {
+	cd := c.cooldown
+	if c.customCooldown > 0 {
+		cd = c.customCooldown
+	}
+	const escalateAfter = 3
+	if c.openCycles <= escalateAfter {
+		return cd
+	}
+	shift := c.openCycles - escalateAfter
+	if shift > 4 {
+		shift = 4 // 16x cap
+	}
+	return cd << shift
+}
+
 // Allow reports whether a request may be sent to the provider. An open
 // circuit transitions to half-open (one probe) once the cooldown elapses.
 func (c *CircuitBreaker) Allow() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	switch c.state {
-	case stateClosed:
+	case stateClosed, stateDegraded:
 		return true
 	case stateDisabled:
 		return false // manual re-enable only
 	case stateOpen:
-		cd := c.cooldown
-		if c.customCooldown > 0 {
-			cd = c.customCooldown
-		}
-		if c.now().Sub(c.openedAt) >= cd {
+		if c.now().Sub(c.openedAt) >= c.effectiveCooldown() {
 			c.state = stateHalfOpen
 			return true
 		}
@@ -110,13 +151,14 @@ func (c *CircuitBreaker) Disabled() bool {
 	return c.state == stateDisabled
 }
 
-// Enable clears the disabled state, trips, and failures (manual re-enable).
+// Enable clears the disabled state, trips, cycles, and failures (manual re-enable).
 func (c *CircuitBreaker) Enable() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.state = stateClosed
 	c.failures = 0
 	c.trips = 0
+	c.openCycles = 0
 	c.customCooldown = 0
 }
 
@@ -125,22 +167,48 @@ func (c *CircuitBreaker) OnSuccess() {
 	defer c.mu.Unlock()
 	c.state = stateClosed
 	c.failures = 0
+	c.openCycles = 0
 	c.customCooldown = 0
 }
 
+// OnFailure counts a generic failure (legacy callers: counts against provider).
 func (c *CircuitBreaker) OnFailure() {
+	c.OnFailureKind(FailureUnknown, true)
+}
+
+// OnFailureKind counts a classified failure. unknown+not-from-upstream (client
+// abort filtered by ClassifyFailure) does not count. Auth/permission opens
+// immediately — probing a bad key is pointless.
+func (c *CircuitBreaker) OnFailureKind(kind FailureKind, countsAgainstProvider bool) {
+	if !countsAgainstProvider {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state == stateDisabled {
 		return
 	}
+	c.lastKind = kind
+	if kind == FailureAuth || kind == FailurePermission {
+		c.failures = c.threshold
+		if c.state == stateHalfOpen {
+			c.openCycles++
+		}
+		c.open()
+		return
+	}
 	if c.state == stateHalfOpen {
+		c.openCycles++
 		c.open()
 		return
 	}
 	c.failures++
 	if c.failures >= c.threshold {
 		c.open()
+		return
+	}
+	if c.state == stateClosed && c.failures >= c.degradationThreshold() {
+		c.state = stateDegraded
 	}
 }
 
@@ -170,18 +238,16 @@ func (c *CircuitBreaker) OpenUntil() time.Time {
 	if c.state != stateOpen {
 		return time.Time{}
 	}
-	cd := c.cooldown
-	if c.customCooldown > 0 {
-		cd = c.customCooldown
-	}
-	return c.openedAt.Add(cd)
+	return c.openedAt.Add(c.effectiveCooldown())
 }
 
-// State returns "closed", "open", "half-open", or "disabled".
+// State returns "closed", "degraded", "open", "half-open", or "disabled".
 func (c *CircuitBreaker) State() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	switch c.state {
+	case stateDegraded:
+		return "degraded"
 	case stateOpen:
 		return "open"
 	case stateHalfOpen:
