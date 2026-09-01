@@ -54,7 +54,7 @@ providers:
 
 routes:
   # Virtual model names clients use in "model" field.
-  # strategy: priority (default) | round_robin | least_latency | weighted | cost
+  # strategy: priority (default) | round_robin | least_latency | weighted | cost | lkgp
   # Failover: retryable statuses (429/500/502/503/504) and transport errors
   # fall through to the next candidate; other statuses are relayed as-is.
   - model: auto
@@ -98,6 +98,14 @@ routes:
         model: gpt-4o
       - provider: deepseek
         model: deepseek-chat
+
+  - model: sticky
+    strategy: lkgp                  # last successfully serving provider first;
+    candidates:                     # on its failure, back to priority order
+      - provider: deepseek
+        model: deepseek-chat
+      - provider: openai
+        model: gpt-4o-mini
 
   - model: smart
     candidates:                     # no strategy -> priority

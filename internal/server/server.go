@@ -199,8 +199,10 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var candidates []router.Candidate
+	strategy := ""
 	if rt := s.router.Resolve(model); rt != nil {
 		candidates = s.router.OrderCandidates(rt)
+		strategy = rt.Strategy
 	} else {
 		// No route: pass through to all providers with the same model name.
 		for _, p := range s.router.Providers() {
@@ -241,6 +243,13 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			errBody, _ := io.ReadAll(io.LimitReader(att.Body, 64<<10))
 			att.Body.Close()
 			s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
+			if att.StatusCode == http.StatusTooManyRequests {
+				s.router.LockModel(c.Provider.Name(), c.Model, 30*time.Second)
+				// After RecordResult so the custom duration isn't clobbered.
+				if d := parseRetryAfter(att.Header.Get("Retry-After")); d > 0 {
+					s.router.OpenCircuitFor(c.Provider.Name(), d)
+				}
+			}
 			if lastFailResp != nil {
 				lastFailResp.Body.Close()
 			}
@@ -252,11 +261,16 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = nil
 			continue
 		}
+		if att.StatusCode == http.StatusNotFound {
+			// Model missing upstream: lock it out briefly, then relay as-is.
+			s.router.LockModel(c.Provider.Name(), c.Model, 30*time.Second)
+		}
 		// Deterministic answer: 2xx success, other 4xx reachable — no failover.
 		s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), true)
 		resp = att
 		break
 	}
+	setDecisionHeader(w, cand, strategy, attempts)
 	if resp == nil {
 		entry := usage.Entry{
 			RequestID: reqID, TS: start, VirtualModel: model,
@@ -317,6 +331,33 @@ func keyName(k *auth.Key) string {
 		return ""
 	}
 	return k.Name
+}
+
+// setDecisionHeader records which provider/model served the request.
+// Must be called before WriteHeader.
+func setDecisionHeader(w http.ResponseWriter, cand router.Candidate, strategy string, attempts int) {
+	w.Header().Set("X-TokenRoute-Decision", "provider="+cand.Provider.Name()+
+		";model="+cand.Model+";strategy="+strategy+";attempts="+strconv.Itoa(attempts))
+}
+
+// parseRetryAfter parses a Retry-After value (seconds int or http-date);
+// garbage -> 0.
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // retryableStatus marks upstream statuses that trigger failover.
@@ -380,6 +421,17 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 	for _, h := range []string{"Content-Type", "Cache-Control"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
+		}
+	}
+	if resp.StatusCode == http.StatusOK && entry.TotalTokens > 0 {
+		// Non-stream only: usage known before WriteHeader. Streams skip these.
+		w.Header().Set("X-TokenRoute-Prompt-Tokens", strconv.Itoa(entry.PromptTokens))
+		w.Header().Set("X-TokenRoute-Completion-Tokens", strconv.Itoa(entry.CompletionTokens))
+		w.Header().Set("X-TokenRoute-Total-Tokens", strconv.Itoa(entry.TotalTokens))
+		if p, ok := s.prices[entry.Model]; ok {
+			if cost := usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p); cost != nil {
+				w.Header().Set("X-TokenRoute-Cost-USD", strconv.FormatFloat(*cost, 'f', -1, 64))
+			}
 		}
 	}
 	w.WriteHeader(resp.StatusCode)

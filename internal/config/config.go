@@ -32,7 +32,7 @@ type CandidateConfig struct {
 
 type RouteConfig struct {
 	Model      string            `yaml:"model"`
-	Strategy   string            `yaml:"strategy"` // priority|round_robin|least_latency|weighted|cost
+	Strategy   string            `yaml:"strategy"` // priority|round_robin|least_latency|weighted|cost|lkgp
 	Candidates []CandidateConfig `yaml:"candidates"`
 }
 
@@ -122,7 +122,7 @@ func (c *Config) Validate() error {
 // validStrategy mirrors router strategy names; kept local to avoid an import.
 func validStrategy(s string) bool {
 	switch s {
-	case "priority", "round_robin", "least_latency", "weighted", "cost":
+	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp":
 		return true
 	}
 	return false

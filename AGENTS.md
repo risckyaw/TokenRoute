@@ -49,8 +49,16 @@ Config: copy `config.example.yaml` to `config.yaml`, set env vars for keys.
   clobbered), forwards the raw body otherwise, and relays the raw upstream
   response (including error statuses) unbuffered so SSE streaming works.
 - Routing: per-route `strategy` (priority|round_robin|least_latency|weighted|
-  cost) orders candidates; candidates whose circuit breaker is open are
-  skipped (half-open allows one probe).
+  cost|lkgp) orders candidates; candidates whose circuit breaker is open are
+  skipped (half-open allows one probe). lkgp keeps a per-route
+  last-known-good provider (Route.lastGood atomic) that goes first until it
+  fails. 429 `Retry-After` opens the provider's breaker for the hinted
+  duration (`CircuitBreaker.OpenFor`); 429/404 lock out that provider+model
+  for 30s (`Router.LockModel`, checked by OrderCandidates).
+- Response headers: every chat response carries `X-TokenRoute-Decision`
+  (provider/model/strategy/attempts); non-stream 200s also carry
+  `X-TokenRoute-{Prompt,Completion,Total}-Tokens` and
+  `X-TokenRoute-Cost-USD` when the upstream model is priced.
 - Failover: transport errors and statuses 429/500/502/503/504 try the next
   candidate (each tried at most once per request); other statuses (200, 400,
   401, 403, 404...) are relayed as-is with no failover. If all candidates

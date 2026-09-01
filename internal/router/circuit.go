@@ -21,13 +21,14 @@ const (
 // closed -> open after threshold consecutive failures; open for cooldown;
 // half-open allowing exactly 1 probe; probe success -> closed, failure -> open.
 type CircuitBreaker struct {
-	mu        sync.Mutex
-	threshold int
-	cooldown  time.Duration
-	failures  int
-	state     int
-	openedAt  time.Time
-	now       func() time.Time // injectable for tests
+	mu             sync.Mutex
+	threshold      int
+	cooldown       time.Duration
+	customCooldown time.Duration // set by OpenFor; consumed on next opening
+	failures       int
+	state          int
+	openedAt       time.Time
+	now            func() time.Time // injectable for tests
 }
 
 func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
@@ -51,7 +52,11 @@ func (c *CircuitBreaker) Allow() bool {
 	case stateClosed:
 		return true
 	case stateOpen:
-		if c.now().Sub(c.openedAt) >= c.cooldown {
+		cd := c.cooldown
+		if c.customCooldown > 0 {
+			cd = c.customCooldown
+		}
+		if c.now().Sub(c.openedAt) >= cd {
 			c.state = stateHalfOpen
 			return true
 		}
@@ -66,6 +71,7 @@ func (c *CircuitBreaker) OnSuccess() {
 	defer c.mu.Unlock()
 	c.state = stateClosed
 	c.failures = 0
+	c.customCooldown = 0
 }
 
 func (c *CircuitBreaker) OnFailure() {
@@ -74,13 +80,46 @@ func (c *CircuitBreaker) OnFailure() {
 	if c.state == stateHalfOpen {
 		c.state = stateOpen
 		c.openedAt = c.now()
+		c.customCooldown = 0
 		return
 	}
 	c.failures++
 	if c.failures >= c.threshold {
 		c.state = stateOpen
 		c.openedAt = c.now()
+		c.customCooldown = 0
 	}
+}
+
+// OpenFor opens the circuit for a custom duration (e.g. Retry-After from a
+// 429 response) instead of the configured cooldown. Failures are set to the
+// threshold so the state is meaningful; the next Allow after d transitions
+// to half-open as usual.
+func (c *CircuitBreaker) OpenFor(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state = stateOpen
+	c.openedAt = c.now()
+	c.customCooldown = d
+	c.failures = c.threshold
+}
+
+// OpenUntil returns when the open circuit will allow a half-open probe.
+// Zero time when not open.
+func (c *CircuitBreaker) OpenUntil() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != stateOpen {
+		return time.Time{}
+	}
+	cd := c.cooldown
+	if c.customCooldown > 0 {
+		cd = c.customCooldown
+	}
+	return c.openedAt.Add(cd)
 }
 
 // State returns "closed", "open", or "half-open" (for later admin use).

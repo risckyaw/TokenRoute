@@ -12,10 +12,14 @@ speak one API.
   raw bodies forwarded, raw upstream responses (incl. errors) relayed, SSE
   streamed unbuffered.
 - **Routing strategies** — priority, round_robin, least_latency, weighted,
-  cost (per virtual model).
+  cost, lkgp (last-known-good provider, per virtual model).
 - **Failover + circuit breakers** — retryable statuses (429/5xx) and
   transport errors fall through to the next candidate; per-provider
-  breakers with half-open probes.
+  breakers with half-open probes; 429 `Retry-After` opens the breaker for
+  the hinted duration; 429/404 lock out that provider+model for 30s.
+- **Observability headers** — every chat response carries
+  `X-TokenRoute-Decision` (provider/model/strategy/attempts); non-stream
+  200s also carry token counts and `X-TokenRoute-Cost-USD` when priced.
 - **Usage logging + pricing** — SQLite log with tokens per request, SSE
   token tracking, per-model USD pricing.
 - **Virtual API keys** — per-key RPM/TPM token buckets, lifetime quotas,
@@ -64,6 +68,7 @@ curl -N localhost:8400/v1/chat/completions \
 | `least_latency`| Lowest EMA latency first; unseen providers first     | Latency-sensitive traffic |
 | `weighted`     | Weighted-random first pick (weight default 1); rest stay in priority order | Gradual traffic shifts / canary |
 | `cost`         | Lowest prompt+completion price first; unpriced last  | Cost optimization |
+| `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
 
 Failover applies to all strategies: 429/500/502/503/504 and transport
 errors try the next candidate (each tried at most once per request). Other
