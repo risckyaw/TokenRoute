@@ -161,3 +161,107 @@ func TestPercentHalfOpenProbeFailureReopens(t *testing.T) {
 		t.Fatalf("state = %s, want open after failed probe", cb.State())
 	}
 }
+
+func TestAllowedFailsPerKind(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureTimeout: 5, FailureRateLimit: 1},
+	})
+	// timeout tolerated 5 times: 5 failures still closed, 6th opens.
+	for i := 0; i < 5; i++ {
+		cb.OnFailureKind(FailureTimeout, true)
+		if cb.State() != "closed" {
+			t.Fatalf("timeout %d: state = %s, want closed", i+1, cb.State())
+		}
+	}
+	cb.OnFailureKind(FailureTimeout, true)
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open after allowed_fails+1 timeouts", cb.State())
+	}
+}
+
+func TestAllowedFailsRateLimitTight(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureRateLimit: 1},
+	})
+	cb.OnFailureKind(FailureRateLimit, true)
+	if cb.State() != "closed" {
+		t.Fatalf("state = %s, want closed at 1 rate_limit", cb.State())
+	}
+	cb.OnFailureKind(FailureRateLimit, true)
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open at allowed_fails+1 rate_limits", cb.State())
+	}
+}
+
+func TestAllowedFailsUnmatchedKindUsesThreshold(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureTimeout: 10},
+	})
+	// network has no entry: global threshold 3 applies.
+	for i := 0; i < 2; i++ {
+		cb.OnFailureKind(FailureNetwork, true)
+		if cb.State() != "closed" {
+			t.Fatalf("network %d: state = %s, want closed", i+1, cb.State())
+		}
+	}
+	cb.OnFailureKind(FailureNetwork, true)
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open at threshold for unmatched kind", cb.State())
+	}
+}
+
+func TestAllowedFailsAuthDefaultInstantOpen(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureTimeout: 10},
+	})
+	cb.OnFailureKind(FailureAuth, true)
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want instant open for auth without override", cb.State())
+	}
+}
+
+func TestAllowedFailsAuthOverride(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureAuth: 2},
+	})
+	cb.OnFailureKind(FailureAuth, true)
+	cb.OnFailureKind(FailureAuth, true)
+	if cb.State() != "closed" {
+		t.Fatalf("state = %s, want closed within explicit auth budget", cb.State())
+	}
+	cb.OnFailureKind(FailureAuth, true)
+	if cb.State() != "open" {
+		t.Fatalf("state = %s, want open past explicit auth budget", cb.State())
+	}
+}
+
+func TestAllowedFailsSuccessResetsKindCounters(t *testing.T) {
+	cb := NewCircuitBreaker(CircuitConfig{
+		FailureThreshold: 3, CooldownMs: 30000,
+		AllowedFails: map[FailureKind]int{FailureRateLimit: 1},
+	})
+	cb.OnFailureKind(FailureRateLimit, true)
+	cb.OnSuccess()
+	cb.OnFailureKind(FailureRateLimit, true)
+	if cb.State() != "closed" {
+		t.Fatalf("state = %s, want closed: success resets kind counters", cb.State())
+	}
+}
+
+func TestParseAllowedFails(t *testing.T) {
+	got := ParseAllowedFails(map[string]int{"timeout": 10, "rate_limit": 3, "bogus": 1})
+	if got[FailureTimeout] != 10 || got[FailureRateLimit] != 3 {
+		t.Fatalf("ParseAllowedFails = %v", got)
+	}
+	if _, ok := got[FailureAuth]; ok {
+		t.Fatal("bogus name must be skipped")
+	}
+	if ParseAllowedFails(map[string]int{"bogus": 1}) != nil {
+		t.Fatal("all-unknown map must return nil (single-counter behavior)")
+	}
+}

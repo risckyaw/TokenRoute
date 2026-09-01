@@ -150,6 +150,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 				Mode:             pc.Circuit.Mode,
 				FailurePercent:   pc.Circuit.FailurePercent,
 				MinRequests:      pc.Circuit.MinRequests,
+				AllowedFails:     router.ParseAllowedFails(pc.Circuit.AllowedFails),
 			})
 		}
 		if pc.QuotaTokenLimit > 0 {

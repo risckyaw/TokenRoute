@@ -18,6 +18,11 @@ type CircuitConfig struct {
 	Mode           string
 	FailurePercent float64 // default 0.5
 	MinRequests    int     // default 5
+	// AllowedFails (LiteLLM per-exception allowed_fails): consecutive failures
+	// of a kind tolerated before opening; the kind trips at allowed_fails+1.
+	// Kinds absent from the map use the global threshold semantics.
+	// Auth/permission keep instant-open unless explicitly present here.
+	AllowedFails map[FailureKind]int
 }
 
 const (
@@ -55,6 +60,41 @@ type CircuitBreaker struct {
 	winStart       time.Time
 	winTotal       int
 	winFailures    int
+	// per-kind policy (nil = single-counter behavior)
+	allowedFails map[FailureKind]int
+	kindFailures map[FailureKind]int
+}
+
+// failureKindNames maps snake_case config names to FailureKind values.
+var failureKindNames = map[string]FailureKind{
+	"auth":              FailureAuth,
+	"permission":        FailurePermission,
+	"rate_limit":        FailureRateLimit,
+	"quota_exhausted":   FailureQuotaExhausted,
+	"timeout":           FailureTimeout,
+	"server":            FailureProvider5xx,
+	"invalid_request":   FailureInvalidRequest,
+	"model_unavailable": FailureModelUnavailable,
+	"network":           FailureNetwork,
+	"unknown":           FailureUnknown,
+}
+
+// ParseAllowedFails converts a snake_case name->count map (YAML) to
+// FailureKind->count; unknown names are skipped.
+func ParseAllowedFails(m map[string]int) map[FailureKind]int {
+	if len(m) == 0 {
+		return nil
+	}
+	out := map[FailureKind]int{}
+	for name, n := range m {
+		if kind, ok := failureKindNames[name]; ok {
+			out[kind] = n
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
@@ -83,6 +123,10 @@ func NewCircuitBreaker(cfg CircuitConfig) *CircuitBreaker {
 		if cb.minRequests <= 0 {
 			cb.minRequests = 5
 		}
+	}
+	if len(cfg.AllowedFails) > 0 {
+		cb.allowedFails = cfg.AllowedFails
+		cb.kindFailures = map[FailureKind]int{}
 	}
 	return cb
 }
@@ -216,6 +260,9 @@ func (c *CircuitBreaker) OnSuccess() {
 	c.failures = 0
 	c.openCycles = 0
 	c.customCooldown = 0
+	if c.kindFailures != nil {
+		c.kindFailures = map[FailureKind]int{}
+	}
 }
 
 // OnFailure counts a generic failure (legacy callers: counts against provider).
@@ -236,6 +283,41 @@ func (c *CircuitBreaker) OnFailureKind(kind FailureKind, countsAgainstProvider b
 		return
 	}
 	c.lastKind = kind
+	if c.allowedFails != nil {
+		if c.state == stateHalfOpen {
+			c.openCycles++
+			c.open()
+			return
+		}
+		c.kindFailures[kind]++
+		limit, explicit := c.allowedFails[kind]
+		switch {
+		case explicit:
+			// Explicit policy: auth/permission lose their instant-open.
+			if c.kindFailures[kind] > limit {
+				c.open()
+			}
+		case kind == FailureAuth || kind == FailurePermission:
+			c.open() // default: instant-open for hopeless credentials
+		default:
+			if c.kindFailures[kind] >= c.threshold {
+				c.open()
+				return
+			}
+			if c.state == stateClosed {
+				max := 0
+				for _, n := range c.kindFailures {
+					if n > max {
+						max = n
+					}
+				}
+				if max >= c.degradationThreshold() {
+					c.state = stateDegraded
+				}
+			}
+		}
+		return
+	}
 	if c.mode == "percent" {
 		trip := c.recordWindow(false)
 		// A failed half-open probe always reopens, regardless of ratio.

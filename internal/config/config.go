@@ -20,6 +20,12 @@ type CircuitConfig struct {
 	Mode           string  `yaml:"mode"`
 	FailurePercent float64 `yaml:"failure_percent"` // default 0.5
 	MinRequests    int     `yaml:"min_requests"`    // default 5
+	// AllowedFails (LiteLLM per-exception allowed_fails): consecutive failures
+	// tolerated per failure kind before opening; absent kinds use the global
+	// threshold, auth/permission stay instant-open unless listed.
+	// Names: auth, permission, rate_limit, quota_exhausted, timeout, server,
+	// invalid_request, model_unavailable, network, unknown.
+	AllowedFails map[string]int `yaml:"allowed_fails"`
 }
 
 type ProviderConfig struct {
