@@ -45,7 +45,11 @@ speak one API.
 - **Usage logging + pricing** — SQLite log with tokens per request, SSE
   token tracking, per-model USD pricing.
 - **Virtual API keys** — per-key RPM/TPM token buckets, lifetime quotas,
-  model allowlists, expiry; full admin API.
+  model allowlists, expiry; full admin API. Rate limits surfaced via
+  `RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset` (RPM) and
+  `X-RateLimit-Token-*` (TPM) response headers; 429s carry `Retry-After`.
+- **Correlation IDs** — every request gets `X-Correlation-ID` (generated
+  when absent, propagated upstream, echoed downstream).
 - **Provider adapters** — [OI]-compatible (DeepSeek, OpenRouter, Ollama...),
   Anthropic Messages API, Gemini generateContent — all exposed as [OI].
 - **Admin dashboard** — single-page dark UI at `/admin/` (keys, usage,

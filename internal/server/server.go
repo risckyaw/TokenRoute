@@ -89,6 +89,7 @@ func NewWithOptions(o Options) http.Handler {
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
 		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB)}
 	mux := chi.NewRouter()
+	mux.Use(correlationID)
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
 		mux.Get("/metrics", s.metricsHandler)
@@ -309,16 +310,32 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			return nil, "", nil, nil, "", 1, false
 		}
 		if s.limiter != nil {
+			rpmLimit := k.RPM
+			if k.ModelRPM > 0 {
+				rpmLimit = k.ModelRPM
+			}
+			if rpmLimit > 0 {
+				w.Header().Set("RateLimit-Limit", strconv.Itoa(rpmLimit))
+				w.Header().Set("RateLimit-Remaining", strconv.Itoa(s.limiter.RPMRemaining(k.ID, rpmLimit)))
+				w.Header().Set("RateLimit-Reset", strconv.Itoa(60))
+			}
+			if k.TPM > 0 {
+				w.Header().Set("X-RateLimit-Token-Limit", strconv.Itoa(k.TPM))
+				w.Header().Set("X-RateLimit-Token-Remaining", strconv.Itoa(s.limiter.TPMRemaining(k.ID, k.TPM)))
+			}
 			if k.ModelRPM > 0 {
 				if !s.limiter.AllowModelRPM(k.ID, model, k.ModelRPM) {
+					w.Header().Set("Retry-After", "60")
 					writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 					return nil, "", nil, nil, "", 1, false
 				}
 			} else if !s.limiter.AllowRPM(k.ID, k.RPM) {
+				w.Header().Set("Retry-After", "60")
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
 			}
 			if s.limiter.TPMRemaining(k.ID, k.TPM) <= 0 {
+				w.Header().Set("Retry-After", "60")
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
 			}

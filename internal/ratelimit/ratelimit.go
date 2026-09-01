@@ -109,6 +109,14 @@ func (r *Registry) AllowRPM(keyID int64, rpm int) bool {
 	return r.get(keyID, rpm, 0).rpm.Allow(1)
 }
 
+// RPMRemaining reports available RPM tokens; huge when rpm is 0.
+func (r *Registry) RPMRemaining(keyID int64, rpm int) int {
+	if rpm <= 0 {
+		return 1 << 62
+	}
+	return r.get(keyID, rpm, 0).rpm.Remaining()
+}
+
 // TPMRemaining reports available TPM tokens; huge when tpm is 0.
 func (r *Registry) TPMRemaining(keyID int64, tpm int) int {
 	if tpm <= 0 {
