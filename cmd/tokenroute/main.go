@@ -211,6 +211,39 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	return &serverState{router: rt, prices: prices, streamIdleMs: sit, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 
+// healthTargets resolves per-provider probe targets: a provider's own
+// health_check block wins; otherwise the global block applies when enabled.
+func healthTargets(cfg *config.Config, rt *router.Router) []server.HealthTarget {
+	byName := map[string]provider.Provider{}
+	for _, p := range rt.Providers() {
+		byName[p.Name()] = p
+	}
+	var out []server.HealthTarget
+	for _, pc := range cfg.Providers {
+		hc := pc.HealthCheck
+		if hc == nil && cfg.HealthCheck != nil && cfg.HealthCheck.Enabled {
+			cp := *cfg.HealthCheck
+			hc = &cp
+		}
+		if hc == nil || !hc.Enabled {
+			continue
+		}
+		model := hc.Model
+		if model == "" {
+			model = rt.FirstModelFor(pc.Name)
+		}
+		if model == "" {
+			continue // no candidate configured; nothing to probe
+		}
+		out = append(out, server.HealthTarget{
+			Provider: byName[pc.Name],
+			Model:    model,
+			Interval: time.Duration(hc.IntervalMs) * time.Millisecond,
+		})
+	}
+	return out
+}
+
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
 func openDB(path string) (*sql.DB, error) {
 	return usage.OpenDB(path)
@@ -286,6 +319,13 @@ func main() {
 		psync := pricing.NewSyncer(state.prices)
 		go psync.Run(context.Background(), 0)
 	}
+
+	// Background health checks (LiteLLM): per-provider probes keep circuit
+	// state and latency EMA warm; never touch quota ledger or usage log.
+	// Cancelled on shutdown via hcCancel.
+	hcCtx, hcCancel := context.WithCancel(context.Background())
+	defer hcCancel()
+	server.RunHealthChecks(hcCtx, state.router, healthTargets(cfg, state.router))
 	var current atomic.Pointer[serverState]
 	current.Store(state)
 

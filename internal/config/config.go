@@ -28,6 +28,14 @@ type CircuitConfig struct {
 	AllowedFails map[string]int `yaml:"allowed_fails"`
 }
 
+// HealthCheckConfig controls per-provider background probes (LiteLLM
+// background health checks): keeps circuit state and latency EMA warm.
+type HealthCheckConfig struct {
+	Enabled    bool   `yaml:"enabled"`     // default false
+	IntervalMs int    `yaml:"interval_ms"` // default 60000
+	Model      string `yaml:"model"`       // upstream model for the probe
+}
+
 type ProviderConfig struct {
 	Name      string   `yaml:"name"`
 	Type      string   `yaml:"type"`
@@ -52,6 +60,10 @@ type ProviderConfig struct {
 	// reset_aware/fill_first/auto read the ledger; 0 = untracked.
 	QuotaTokenLimit    int64 `yaml:"quota_token_limit"`
 	QuotaWindowSeconds int   `yaml:"quota_window_seconds"` // default 60
+	// HealthCheck enables a background probe goroutine (max_tokens=1 "hi"
+	// chat through the normal provider path); results feed circuit/EMA only,
+	// never the quota ledger or usage log.
+	HealthCheck *HealthCheckConfig `yaml:"health_check"`
 }
 
 type CandidateConfig struct {
@@ -135,6 +147,9 @@ type Config struct {
 	// PromptCacheAffinity (global default, routes may override): pin
 	// cacheable prompt prefixes to the serving provider+model for 1h.
 	PromptCacheAffinity bool `yaml:"prompt_cache_affinity"`
+	// HealthCheck is the global background-probe default; a provider's own
+	// health_check block wins entirely.
+	HealthCheck *HealthCheckConfig `yaml:"health_check"`
 }
 
 func Load(path string) (*Config, error) {
