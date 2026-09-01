@@ -25,7 +25,8 @@ import (
 	"github.com/Jarvisagentic/tokenroute/internal/usage"
 )
 
-const maxBody = 10 << 20 // 10MB
+// defaultMaxBodyMB caps request bodies when Options.MaxBodyMB is unset.
+const defaultMaxBodyMB = 10
 
 // errContextExceeded marks a candidate skipped by the context-window guard.
 var errContextExceeded = errors.New("prompt exceeds model context window")
@@ -74,6 +75,8 @@ type Options struct {
 	// StreamIdleMs aborts a streaming relay after N ms without upstream
 	// bytes, per provider name (missing/0 = disabled).
 	StreamIdleMs map[string]int
+	// MaxBodyMB caps request bodies (0 = default 10MB).
+	MaxBodyMB int
 }
 
 // New builds the handler. Kept for compatibility: auth disabled.
@@ -84,7 +87,7 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs}
+		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB)}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
@@ -108,7 +111,7 @@ func NewWithOptions(o Options) http.Handler {
 func NewAdminOnly(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs}
+		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB)}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
@@ -133,6 +136,8 @@ func (s *srv) registerAdmin(mux chi.Router) {
 		r.Get("/providers", s.adminProviders)
 		r.Post("/providers/{name}/test", s.adminProviderTest)
 		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
+		r.Post("/providers/{name}/disable", s.adminProviderDisable)
+		r.Post("/providers/{name}/enable", s.adminProviderEnable)
 	})
 }
 
@@ -147,6 +152,15 @@ type srv struct {
 	metrics  *metrics.Registry
 	// streamIdleMs: per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
+	maxBody      int64
+}
+
+// maxBodyBytes converts MB to bytes; 0/negative -> 10MB default.
+func maxBodyBytes(mb int) int64 {
+	if mb <= 0 {
+		mb = defaultMaxBodyMB
+	}
+	return int64(mb) << 20
 }
 
 // metricsHandler serves GET /metrics (Prometheus text exposition, no auth).
@@ -264,18 +278,19 @@ func embedCall(ctx context.Context, p provider.Provider, req *provider.Request) 
 
 // prepareRequest validates the body/model, applies per-key auth/ratelimit/
 // quota, and resolves ordered candidates. ok=false = error already written.
-func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byte, model string, k *auth.Key, candidates []router.Candidate, strategy string, ok bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+// mult is the route cost multiplier (1.0 for passthrough requests).
+func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byte, model string, k *auth.Key, candidates []router.Candidate, strategy string, mult float64, ok bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBody))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
-		return nil, "", nil, nil, "", false
+		return nil, "", nil, nil, "", 1, false
 	}
 	var parsed map[string]any
 	_ = json.Unmarshal(body, &parsed)
 	model, _ = parsed["model"].(string)
 	if model == "" {
 		writeErr(w, http.StatusBadRequest, "missing or empty \"model\" field", "invalid_request_error")
-		return nil, "", nil, nil, "", false
+		return nil, "", nil, nil, "", 1, false
 	}
 
 	// Phase 4: per-key authorization, rate limits, quota.
@@ -283,31 +298,38 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	if k != nil {
 		if !modelAllowed(k, model) {
 			writeErr(w, http.StatusForbidden, "model not allowed for this API key", "model_not_allowed")
-			return nil, "", nil, nil, "", false
+			return nil, "", nil, nil, "", 1, false
 		}
 		if k.QuotaTokens > 0 && k.SpentTokens >= k.QuotaTokens {
 			writeErr(w, http.StatusForbidden, "token quota exceeded", "quota_exceeded")
-			return nil, "", nil, nil, "", false
+			return nil, "", nil, nil, "", 1, false
 		}
 		if k.BudgetUSD > 0 && k.SpentUSD >= k.BudgetUSD {
 			writeErr(w, http.StatusPaymentRequired, "USD budget exhausted", "budget_exceeded")
-			return nil, "", nil, nil, "", false
+			return nil, "", nil, nil, "", 1, false
 		}
 		if s.limiter != nil {
-			if !s.limiter.AllowRPM(k.ID, k.RPM) {
+			if k.ModelRPM > 0 {
+				if !s.limiter.AllowModelRPM(k.ID, model, k.ModelRPM) {
+					writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
+					return nil, "", nil, nil, "", 1, false
+				}
+			} else if !s.limiter.AllowRPM(k.ID, k.RPM) {
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return nil, "", nil, nil, "", false
+				return nil, "", nil, nil, "", 1, false
 			}
 			if s.limiter.TPMRemaining(k.ID, k.TPM) <= 0 {
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return nil, "", nil, nil, "", false
+				return nil, "", nil, nil, "", 1, false
 			}
 		}
 	}
 
+	mult = 1
 	if rt := s.router.Resolve(model); rt != nil {
 		candidates = s.router.OrderCandidates(rt)
 		strategy = rt.Strategy
+		mult = rt.Multiplier
 	} else {
 		// No route: pass through to all providers with the same model name.
 		for _, p := range s.router.Providers() {
@@ -316,7 +338,7 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	}
 	if len(candidates) == 0 {
 		writeErr(w, http.StatusBadRequest, "no provider available for model: "+model, "invalid_request_error")
-		return nil, "", nil, nil, "", false
+		return nil, "", nil, nil, "", 1, false
 	}
 	// Group access: drop candidates whose groups don't intersect the key's
 	// groups (empty on either side = wildcard).
@@ -330,10 +352,10 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 		candidates = filtered
 		if len(candidates) == 0 {
 			writeErr(w, http.StatusForbidden, "no available channel for your group", "group_forbidden")
-			return nil, "", nil, nil, "", false
+			return nil, "", nil, nil, "", 1, false
 		}
 	}
-	return body, model, k, candidates, strategy, true
+	return body, model, k, candidates, strategy, mult, true
 }
 
 // groupsIntersect reports whether any group appears in both lists
@@ -441,7 +463,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqID := newRequestID()
 	w.Header().Set("X-Request-Id", reqID)
 
-	body, model, k, candidates, strategy, ok := s.prepareRequest(w, r)
+	body, model, k, candidates, strategy, mult, ok := s.prepareRequest(w, r)
 	if !ok {
 		return
 	}
@@ -550,8 +572,12 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		respBody = s.relayFull(w, resp, &entry)
 	}
 	entry.LatencyMs = time.Since(start).Milliseconds()
+	entry.Multiplier = mult
 	if p, ok := s.prices[cand.Model]; ok {
 		entry.CostUSD = usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p)
+	}
+	if entry.CostUSD != nil && mult != 1 {
+		*entry.CostUSD *= mult
 	}
 	if hasBudget && entry.CostUSD != nil && *entry.CostUSD > budget {
 		entry.BudgetExceeded = true
@@ -590,7 +616,7 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	reqID := newRequestID()
 	w.Header().Set("X-Request-Id", reqID)
 
-	body, model, k, candidates, strategy, ok := s.prepareRequest(w, r)
+	body, model, k, candidates, strategy, mult, ok := s.prepareRequest(w, r)
 	if !ok {
 		return
 	}
@@ -625,8 +651,12 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	entry.CompletionTokens = 0
 	entry.TotalTokens = entry.PromptTokens
 	entry.LatencyMs = time.Since(start).Milliseconds()
+	entry.Multiplier = mult
 	if p, ok := s.prices[cand.Model]; ok {
 		entry.CostUSD = usage.EmbedCost(entry.PromptTokens, &p)
+	}
+	if entry.CostUSD != nil && mult != 1 {
+		*entry.CostUSD *= mult
 	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {

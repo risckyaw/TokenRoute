@@ -56,6 +56,7 @@ func masked(k auth.Key) map[string]any {
 	}
 	return map[string]any{
 		"id": k.ID, "key": m, "name": k.Name, "rpm": k.RPM, "tpm": k.TPM,
+		"model_rpm":    k.ModelRPM,
 		"quota_tokens": k.QuotaTokens, "spent_tokens": k.SpentTokens,
 		"budget_usd": k.BudgetUSD, "spent_usd": k.SpentUSD,
 		"allowed_models": k.AllowedModels, "groups": k.Groups, "expires_at": k.ExpiresAt,
@@ -67,6 +68,7 @@ type createKeyReq struct {
 	Name          string   `json:"name"`
 	RPM           int      `json:"rpm"`
 	TPM           int      `json:"tpm"`
+	ModelRPM      int      `json:"model_rpm"`
 	QuotaTokens   int64    `json:"quota_tokens"`
 	BudgetUSD     float64  `json:"budget_usd"`
 	AllowedModels []string `json:"allowed_models"`
@@ -85,7 +87,7 @@ func (s *srv) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k := auth.Key{
-		Name: req.Name, RPM: req.RPM, TPM: req.TPM,
+		Name: req.Name, RPM: req.RPM, TPM: req.TPM, ModelRPM: req.ModelRPM,
 		QuotaTokens: req.QuotaTokens, BudgetUSD: req.BudgetUSD,
 		AllowedModels: req.AllowedModels, Groups: req.Groups, Enabled: true,
 	}
@@ -231,11 +233,15 @@ func (s *srv) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{"id", "ts", "key_name", "virtual_model", "provider", "model",
 		"prompt_tokens", "completion_tokens", "total_tokens", "stream", "status",
-		"latency_ms", "cost_usd", "budget_exceeded", "cached"})
+		"latency_ms", "cost_usd", "multiplier", "budget_exceeded", "cached"})
 	err := s.usage.ExportRows(from, to, func(e usage.Entry) error {
 		cost := ""
 		if e.CostUSD != nil {
 			cost = strconv.FormatFloat(*e.CostUSD, 'f', -1, 64)
+		}
+		mult := e.Multiplier
+		if mult == 0 {
+			mult = 1
 		}
 		return cw.Write([]string{
 			strconv.FormatInt(e.ID, 10),
@@ -243,7 +249,8 @@ func (s *srv) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 			e.KeyName, e.VirtualModel, e.Provider, e.Model,
 			strconv.Itoa(e.PromptTokens), strconv.Itoa(e.CompletionTokens), strconv.Itoa(e.TotalTokens),
 			strconv.FormatBool(e.Stream), strconv.Itoa(e.Status),
-			strconv.FormatInt(e.LatencyMs, 10), cost, strconv.FormatBool(e.BudgetExceeded),
+			strconv.FormatInt(e.LatencyMs, 10), cost, strconv.FormatFloat(mult, 'f', -1, 64),
+			strconv.FormatBool(e.BudgetExceeded),
 			strconv.FormatBool(e.Cached),
 		})
 	})
@@ -260,6 +267,7 @@ func (s *srv) adminProviders(w http.ResponseWriter, _ *http.Request) {
 			"name":           p.Name(),
 			"priority":       p.Priority(),
 			"circuit":        s.router.CircuitState(p.Name()),
+			"disabled":       s.router.ProviderDisabled(p.Name()),
 			"ema_latency_ms": s.router.LatencyMs(p.Name()),
 		})
 	}
@@ -270,6 +278,20 @@ func (s *srv) adminCircuitReset(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	s.router.ResetCircuit(name)
 	writeJSON(w, http.StatusOK, map[string]any{"provider": name, "circuit": s.router.CircuitState(name)})
+}
+
+func (s *srv) adminProviderDisable(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	s.router.DisableProvider(name)
+	writeJSON(w, http.StatusOK, map[string]any{"provider": name, "disabled": s.router.ProviderDisabled(name)})
+}
+
+// adminProviderEnable re-enables a disabled provider: breaker closed, auto-
+// disable trip counter reset.
+func (s *srv) adminProviderEnable(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	s.router.EnableProvider(name)
+	writeJSON(w, http.StatusOK, map[string]any{"provider": name, "disabled": s.router.ProviderDisabled(name), "circuit": s.router.CircuitState(name)})
 }
 
 // adminProviderTest sends a minimal chat completion through the provider to

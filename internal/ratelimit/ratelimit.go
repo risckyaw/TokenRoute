@@ -2,6 +2,8 @@
 package ratelimit
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -87,14 +89,16 @@ type buckets struct {
 	tpm *TokenBucket
 }
 
-// Registry lazily keeps RPM/TPM buckets per key ID.
+// Registry lazily keeps RPM/TPM buckets per key ID, plus per-(key,model)
+// RPM buckets.
 type Registry struct {
-	mu   sync.Mutex
-	byID map[int64]*buckets
+	mu       sync.Mutex
+	byID     map[int64]*buckets
+	modelRPM map[string]*TokenBucket // "keyID:model" -> bucket
 }
 
 func NewRegistry() *Registry {
-	return &Registry{byID: map[int64]*buckets{}}
+	return &Registry{byID: map[int64]*buckets{}, modelRPM: map[string]*TokenBucket{}}
 }
 
 // AllowRPM takes one request token; always true when rpm is 0.
@@ -145,4 +149,30 @@ func (r *Registry) Invalidate(keyID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.byID, keyID)
+	prefix := strconv.FormatInt(keyID, 10) + ":"
+	for k := range r.modelRPM {
+		if strings.HasPrefix(k, prefix) {
+			delete(r.modelRPM, k)
+		}
+	}
+}
+
+// AllowModelRPM takes one request token from the per-(key,model) bucket of
+// capacity modelRPM; always true when modelRPM is 0.
+func (r *Registry) AllowModelRPM(keyID int64, model string, modelRPM int) bool {
+	if modelRPM <= 0 {
+		return true
+	}
+	ns := strconv.FormatInt(keyID, 10) + ":" + model
+	r.mu.Lock()
+	b, ok := r.modelRPM[ns]
+	if !ok || b.capacity != float64(modelRPM) {
+		b = NewBucket(modelRPM, float64(modelRPM)/60)
+		if r.modelRPM == nil {
+			r.modelRPM = map[string]*TokenBucket{}
+		}
+		r.modelRPM[ns] = b
+	}
+	r.mu.Unlock()
+	return b.Allow(1)
 }

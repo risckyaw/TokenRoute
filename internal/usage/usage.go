@@ -40,6 +40,8 @@ type Entry struct {
 	CostUSD          *float64  `json:"cost_usd"`
 	BudgetExceeded   bool      `json:"budget_exceeded"`
 	Cached           bool      `json:"cached"`
+	// Multiplier is the route cost multiplier applied to CostUSD (default 1).
+	Multiplier float64 `json:"multiplier"`
 }
 
 // KeyAggregate is the per-key usage rollup for the admin API.
@@ -111,7 +113,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	}
 	// Phase 4 columns; ALTER fails on existing DBs that have them, so add
 	// only when missing (checked via pragma).
-	for _, col := range []string{"key_id INTEGER", "key_name TEXT", "budget_exceeded INTEGER", "cached INTEGER"} {
+	for _, col := range []string{"key_id INTEGER", "key_name TEXT", "budget_exceeded INTEGER", "cached INTEGER", "multiplier REAL DEFAULT 1"} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "usage_logs", name) {
 			if _, err := db.Exec(`ALTER TABLE usage_logs ADD COLUMN ` + col); err != nil {
@@ -156,14 +158,18 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 	if e.CostUSD != nil {
 		cost = *e.CostUSD
 	}
+	mult := e.Multiplier
+	if mult == 0 {
+		mult = 1
+	}
 	_, err := l.db.ExecContext(ctx, `INSERT INTO usage_logs
 		(request_id, ts, key_id, key_name, virtual_model, provider, model, prompt_tokens,
-		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd, budget_exceeded, cached)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd, budget_exceeded, cached, multiplier)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.RequestID, e.TS.UTC().Format(time.RFC3339Nano), e.KeyID, e.KeyName,
 		e.VirtualModel, e.Provider, e.Model,
 		e.PromptTokens, e.CompletionTokens, e.TotalTokens, boolInt(e.Stream),
-		e.Status, e.LatencyMs, cost, boolInt(e.BudgetExceeded), boolInt(e.Cached))
+		e.Status, e.LatencyMs, cost, boolInt(e.BudgetExceeded), boolInt(e.Cached), mult)
 	return err
 }
 
@@ -171,7 +177,7 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
 		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
-		COALESCE(budget_exceeded,0), COALESCE(cached,0)
+		COALESCE(budget_exceeded,0), COALESCE(cached,0), COALESCE(multiplier,1)
 		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -185,7 +191,7 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 		var cost sql.NullFloat64
 		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
-			&e.Status, &e.LatencyMs, &cost, &budget, &cached); err != nil {
+			&e.Status, &e.LatencyMs, &cost, &budget, &cached, &e.Multiplier); err != nil {
 			return nil, err
 		}
 		e.KeyName = keyName
@@ -206,7 +212,7 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 func (l *Logger) ExportRows(from, to time.Time, fn func(Entry) error) error {
 	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
 		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
-		COALESCE(budget_exceeded,0), COALESCE(cached,0)
+		COALESCE(budget_exceeded,0), COALESCE(cached,0), COALESCE(multiplier,1)
 		FROM usage_logs WHERE ts >= ? AND ts <= ? ORDER BY id`,
 		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -220,7 +226,7 @@ func (l *Logger) ExportRows(from, to time.Time, fn func(Entry) error) error {
 		var cost sql.NullFloat64
 		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
-			&e.Status, &e.LatencyMs, &cost, &budget, &cached); err != nil {
+			&e.Status, &e.LatencyMs, &cost, &budget, &cached, &e.Multiplier); err != nil {
 			return err
 		}
 		e.KeyName = keyName

@@ -18,6 +18,7 @@ type Key struct {
 	Name          string     `json:"name"`
 	RPM           int        `json:"rpm"`          // requests/min; 0 = unlimited
 	TPM           int        `json:"tpm"`          // tokens/min; 0 = unlimited
+	ModelRPM      int        `json:"model_rpm"`    // per-(key,model) requests/min; 0 = use RPM
 	QuotaTokens   int64      `json:"quota_tokens"` // lifetime cap; 0 = unlimited
 	SpentTokens   int64      `json:"spent_tokens"`
 	BudgetUSD     float64    `json:"budget_usd"` // lifetime USD cap; 0 = unlimited
@@ -29,11 +30,38 @@ type Key struct {
 	CreatedAt     time.Time  `json:"created_at"`
 }
 
-// GenerateKey returns "gw-" + 32 hex chars from crypto/rand.
-func GenerateKey() string {
+// GenerateKey returns a random key string. With a non-empty name the prefix
+// is "gw-<slug>-" (slug from name) + 24 hex chars; otherwise the back-compat
+// shape "gw-" + 32 hex chars.
+func GenerateKey(name string) string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
+	if slug := slugify(name); slug != "" {
+		return "gw-" + slug + "-" + hex.EncodeToString(b[:12])
+	}
 	return "gw-" + hex.EncodeToString(b[:])
+}
+
+// slugify lowercases, maps every non-alnum run to "-", trims dashes, and caps
+// at 20 chars. "" for names with no alnum characters.
+func slugify(s string) string {
+	var out []byte
+	dash := false
+	for _, r := range strings.ToLower(s) {
+		isAlnum := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		switch {
+		case isAlnum:
+			out = append(out, byte(r))
+			dash = false
+		case !dash && len(out) > 0:
+			out = append(out, '-')
+			dash = true
+		}
+		if len(out) >= 20 {
+			break
+		}
+	}
+	return strings.TrimRight(string(out), "-")
 }
 
 // Store persists keys in SQLite. Share the *sql.DB with usage.Logger
@@ -59,8 +87,8 @@ func NewStore(db *sql.DB) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("create api_keys table: %w", err)
 	}
-	// Batch 4/5 columns; add only when missing (existing DBs).
-	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0", `groups TEXT DEFAULT ''`} {
+	// Batch 4/5/6 columns; add only when missing (existing DBs).
+	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0", `groups TEXT DEFAULT ''`, "model_rpm INTEGER DEFAULT 0"} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "api_keys", name) {
 			if _, err := db.Exec(`ALTER TABLE api_keys ADD COLUMN ` + col); err != nil {
@@ -86,10 +114,10 @@ func hasColumn(db *sql.DB, table, col string) bool {
 	return false
 }
 
-// Create inserts a key, generating the key string when empty.
+// Create inserts a key, generating the key string from the name when empty.
 func (s *Store) Create(k Key) (Key, error) {
 	if k.Key == "" {
-		k.Key = GenerateKey()
+		k.Key = GenerateKey(k.Name)
 	}
 	models, err := json.Marshal(k.AllowedModels)
 	if err != nil {
@@ -105,9 +133,9 @@ func (s *Store) Create(k Key) (Key, error) {
 	}
 	k.CreatedAt = time.Now().UTC()
 	res, err := s.db.Exec(`INSERT INTO api_keys
-		(key, name, rpm, tpm, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, groups, expires_at, enabled, created_at)
-		VALUES (?,?,?,?,?,0,?,0,?,?,?,?,?)`,
-		k.Key, k.Name, k.RPM, k.TPM, k.QuotaTokens, k.BudgetUSD, string(models), string(groups), expires, boolInt(k.Enabled),
+		(key, name, rpm, tpm, model_rpm, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, groups, expires_at, enabled, created_at)
+		VALUES (?,?,?,?,?,?,0,?,0,?,?,?,?,?)`,
+		k.Key, k.Name, k.RPM, k.TPM, k.ModelRPM, k.QuotaTokens, k.BudgetUSD, string(models), string(groups), expires, boolInt(k.Enabled),
 		k.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return Key{}, err
@@ -118,7 +146,7 @@ func (s *Store) Create(k Key) (Key, error) {
 
 // GetByKey returns the key row or (nil, nil) when unknown.
 func (s *Store) GetByKey(key string) (*Key, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
+	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys WHERE key = ?`, key)
 	if err != nil {
@@ -137,7 +165,7 @@ func (s *Store) GetByKey(key string) (*Key, error) {
 
 // List returns all keys, newest first.
 func (s *Store) List() ([]Key, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
+	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys ORDER BY id DESC`)
 	if err != nil {
@@ -160,7 +188,7 @@ func scanKey(rows *sql.Rows) (Key, error) {
 	var models, groups, created string
 	var expires sql.NullString
 	var enabled int
-	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.QuotaTokens,
+	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.ModelRPM, &k.QuotaTokens,
 		&k.SpentTokens, &k.BudgetUSD, &k.SpentUSD, &models, &groups, &expires, &enabled, &created); err != nil {
 		return Key{}, err
 	}

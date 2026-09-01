@@ -150,9 +150,10 @@ transport error (502 when all candidates time out).
 | `listen` | Address, default `:8400` |
 | `usage_db` | SQLite path (usage logs + API keys), default `data/usage.db` |
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
+| `max_body_mb` | Max request body size in MB, default 10 |
 | `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard |
-| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms}` (defaults 3/30000) |
-| `routes[]` | Virtual `model`, optional `strategy`, ordered `candidates` (`provider`, upstream `model`, optional `weight`) |
+| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin) |
+| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), ordered `candidates` (`provider`, upstream `model`, optional `weight`) |
 
 Provider types:
 
@@ -173,14 +174,15 @@ Header `X-Admin-Key: <admin_key>` on every call:
 
 | Route | Description |
 |---|---|
-| `POST /admin/keys` | Create key `{name, rpm, tpm, quota_tokens, budget_usd, allowed_models, expires_at}` — full key returned only here |
+| `POST /admin/keys` | Create key `{name, rpm, tpm, model_rpm, quota_tokens, budget_usd, allowed_models, expires_at}` — full key returned only here; `model_rpm` = per-(key,model) RPM (0 = use global `rpm`) |
 | `GET /admin/keys` | List keys (masked) |
 | `POST /admin/keys/{id}/disable` / `/enable` | Toggle key |
 | `DELETE /admin/keys/{id}` | Delete key |
 | `GET /admin/usage` | Per-key aggregates + totals |
 | `GET /admin/usage/export?format=csv&from&to` | Stream usage logs as CSV (RFC3339 range, default last 24h) |
-| `GET /admin/providers` | Circuit state + EMA latency per provider |
+| `GET /admin/providers` | Circuit state + EMA latency + `disabled` flag per provider |
 | `POST /admin/providers/{name}/circuit/reset` | Reset circuit breaker |
+| `POST /admin/providers/{name}/disable` / `/enable` | Disable/enable provider channel (enable resets breaker + auto-disable counter) |
 
 Client-facing: `GET /v1/models`, `GET /v1/usage/recent?limit=N` (≤500),
 `GET /healthz` (unauthenticated).

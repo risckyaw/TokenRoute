@@ -41,6 +41,7 @@ type serverState struct {
 	metrics  *metrics.Registry
 	// streamIdleMs is the per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
+	maxBodyMB    int
 }
 
 func buildState(cfg *config.Config) (*serverState, error) {
@@ -101,7 +102,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 	}
 	routes := make([]*router.Route, 0, len(cfg.Routes))
 	for _, rc := range cfg.Routes {
-		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy}
+		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
 				Provider: byName[cc.Provider],
@@ -126,10 +127,11 @@ func buildState(cfg *config.Config) (*serverState, error) {
 			rt.SetCircuit(pc.Name, router.CircuitConfig{
 				FailureThreshold: pc.Circuit.FailureThreshold,
 				CooldownMs:       pc.Circuit.CooldownMs,
+				AutoDisableAfter: pc.Circuit.AutoDisableAfter,
 			})
 		}
 	}
-	return &serverState{router: rt, prices: prices, streamIdleMs: sit}, nil
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit, maxBodyMB: cfg.MaxBodyMB}, nil
 }
 
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
@@ -210,6 +212,7 @@ func main() {
 			Metrics:       st.metrics,
 			SeparateAdmin: cfg.AdminListen != "",
 			StreamIdleMs:  st.streamIdleMs,
+			MaxBodyMB:     st.maxBodyMB,
 		}).ServeHTTP(w, r)
 	})
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler}
@@ -226,6 +229,7 @@ func main() {
 				Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
 				Metrics: st.metrics,
 			}).ServeHTTP(w, r)
+			// admin-only mux has no proxied endpoints; body cap unused
 		})
 		adminSrv = &http.Server{Addr: adminAddr, Handler: adminHandler}
 	}

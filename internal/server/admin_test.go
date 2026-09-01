@@ -92,7 +92,7 @@ func TestAdmin_KeyRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(created.Key, "gw-") || len(created.Key) != 35 {
+	if !strings.HasPrefix(created.Key, "gw-ci-") || len(created.Key) != len("gw-ci-")+24 {
 		t.Fatalf("key format %q", created.Key)
 	}
 	if !created.Enabled || created.RPM != 60 {

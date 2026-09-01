@@ -46,6 +46,7 @@ type Candidate struct {
 type Route struct {
 	Model      string
 	Strategy   string
+	Multiplier float64     // cost multiplier; 0 -> 1.0
 	Candidates []Candidate // sorted by Provider.Priority() ascending
 
 	rr       atomic.Uint64 // round-robin counter
@@ -94,6 +95,9 @@ func New(providers []provider.Provider, routes []*Route) *Router {
 	for _, rt := range routes {
 		if rt.Strategy == "" {
 			rt.Strategy = StrategyPriority
+		}
+		if rt.Multiplier == 0 {
+			rt.Multiplier = 1.0
 		}
 		for i := range rt.Candidates {
 			if rt.Candidates[i].Weight <= 0 {
@@ -329,10 +333,35 @@ func (r *Router) CircuitState(providerName string) string {
 }
 
 // ResetCircuit force-closes the breaker for a provider (no-op if none).
+// Does not clear the auto-disabled state; use EnableProvider for that.
 func (r *Router) ResetCircuit(providerName string) {
 	if cb, ok := r.circuits[providerName]; ok {
 		cb.OnSuccess()
 	}
+}
+
+// DisableProvider forces the provider's breaker into the disabled state
+// (Allow always false) until EnableProvider.
+func (r *Router) DisableProvider(providerName string) {
+	if cb, ok := r.circuits[providerName]; ok {
+		cb.Disable()
+	}
+}
+
+// EnableProvider re-enables a disabled provider: breaker closed, trips reset.
+func (r *Router) EnableProvider(providerName string) {
+	if cb, ok := r.circuits[providerName]; ok {
+		cb.Enable()
+	}
+}
+
+// ProviderDisabled reports whether the provider's breaker is disabled
+// (manually or via auto-disable); false when no breaker is configured.
+func (r *Router) ProviderDisabled(providerName string) bool {
+	if cb, ok := r.circuits[providerName]; ok {
+		return cb.Disabled()
+	}
+	return false
 }
 
 // LatencyMs returns the EMA latency in ms for a provider (0 if unseen).

@@ -4,6 +4,9 @@ usage_db: "data/usage.db"
 # Admin API key (X-Admin-Key header). Empty/missing -> /admin routes return 503.
 admin_key: "${GATEWAY_ADMIN_KEY}"
 
+# Max request body size in MB (default 10).
+#max_body_mb: 10
+
 # USD per 1M tokens, keyed by UPSTREAM model name.
 # context_tokens (optional) enables the context-window guard for that model.
 prices:
@@ -21,7 +24,9 @@ providers:
     timeout_ms: 120000
     # Optional per-provider circuit breaker (defaults shown):
     # opens after N consecutive failures, cools down, then allows 1 probe.
-    circuit: {failure_threshold: 3, cooldown_ms: 30000}
+    # auto_disable_after: after N open-transitions the provider is disabled
+    # until POST /admin/providers/{name}/enable (default 3; 0 = default).
+    circuit: {failure_threshold: 3, cooldown_ms: 30000, auto_disable_after: 3}
     # Bounds ONLY the wait for upstream response headers (default 15min).
     # Streaming after headers arrive is unaffected. 0 = default.
     #response_header_timeout_ms: 900000
@@ -73,6 +78,8 @@ routes:
   # fall through to the next candidate; other statuses are relayed as-is.
   - model: auto
     strategy: priority              # first candidate by priority; failover on retryable errors
+    # multiplier scales the logged USD cost for this route (default 1.0).
+    #multiplier: 1.0
     candidates:
       - provider: deepseek
         model: deepseek-chat

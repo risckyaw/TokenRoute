@@ -12,6 +12,9 @@ import (
 type CircuitConfig struct {
 	FailureThreshold int `yaml:"failure_threshold"` // default 3
 	CooldownMs       int `yaml:"cooldown_ms"`       // default 30000
+	// AutoDisableAfter: after N open-transitions the breaker stays disabled
+	// until manually re-enabled (default 3; 0 = never auto-disable).
+	AutoDisableAfter int `yaml:"auto_disable_after"`
 }
 
 type ProviderConfig struct {
@@ -44,7 +47,8 @@ type CandidateConfig struct {
 
 type RouteConfig struct {
 	Model      string            `yaml:"model"`
-	Strategy   string            `yaml:"strategy"` // priority|round_robin|least_latency|weighted|cost|lkgp|headroom
+	Strategy   string            `yaml:"strategy"`   // priority|round_robin|least_latency|weighted|cost|lkgp|headroom
+	Multiplier float64           `yaml:"multiplier"` // cost multiplier; default 1.0
 	Candidates []CandidateConfig `yaml:"candidates"`
 }
 
@@ -66,6 +70,7 @@ type Config struct {
 	AdminListen string                 `yaml:"admin_listen"` // optional dedicated admin listener
 	UsageDB     string                 `yaml:"usage_db"`
 	AdminKey    string                 `yaml:"admin_key"`
+	MaxBodyMB   int                    `yaml:"max_body_mb"` // request body cap; default 10
 	Cache       CacheConfig            `yaml:"cache"`
 	Providers   []ProviderConfig       `yaml:"providers"`
 	Routes      []RouteConfig          `yaml:"routes"`
