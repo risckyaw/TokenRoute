@@ -56,7 +56,9 @@ func masked(k auth.Key) map[string]any {
 	}
 	return map[string]any{
 		"id": k.ID, "key": m, "name": k.Name, "rpm": k.RPM, "tpm": k.TPM,
-		"model_rpm":    k.ModelRPM,
+		"model_rpm":       k.ModelRPM,
+		"limit_by_header": k.LimitByHeader,
+		"daily_quota":     k.DailyQuota, "daily_used": k.DailyUsed,
 		"quota_tokens": k.QuotaTokens, "spent_tokens": k.SpentTokens,
 		"budget_usd": k.BudgetUSD, "spent_usd": k.SpentUSD,
 		"allowed_models": k.AllowedModels, "groups": k.Groups, "expires_at": k.ExpiresAt,
