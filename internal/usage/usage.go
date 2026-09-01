@@ -21,6 +21,7 @@ type Price struct {
 
 // Entry is one logged request.
 type Entry struct {
+	ID               int64     `json:"id,omitempty"`
 	RequestID        string    `json:"request_id"`
 	TS               time.Time `json:"ts"`
 	KeyID            int64     `json:"key_id"`
@@ -150,7 +151,7 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 
 // QueryRecent returns the newest entries, up to limit.
 func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
-	rows, err := l.db.Query(`SELECT request_id, ts, key_id, key_name, virtual_model, provider, model,
+	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
 		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd
 		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
@@ -163,7 +164,7 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 		var ts, keyName string
 		var stream int
 		var cost sql.NullFloat64
-		if err := rows.Scan(&e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
+		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
 			&e.Status, &e.LatencyMs, &cost); err != nil {
 			return nil, err

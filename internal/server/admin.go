@@ -167,6 +167,25 @@ func (s *srv) adminUsage(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"keys": aggs, "totals": totals})
 }
 
+func (s *srv) adminUsageLogs(w http.ResponseWriter, r *http.Request) {
+	if s.usage == nil {
+		writeErr(w, http.StatusServiceUnavailable, "usage logging disabled", "invalid_request_error")
+		return
+	}
+	limit := 50
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			limit = min(n, 200)
+		}
+	}
+	entries, err := s.usage.QueryRecent(limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "usage logs query: "+err.Error(), "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
 func (s *srv) adminProviders(w http.ResponseWriter, _ *http.Request) {
 	out := []map[string]any{}
 	for _, p := range s.router.Providers() {

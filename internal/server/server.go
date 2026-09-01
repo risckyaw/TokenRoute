@@ -84,6 +84,7 @@ func (s *srv) registerAdmin(mux chi.Router) {
 		r.Post("/keys/{id}/enable", s.adminSetKey(true))
 		r.Delete("/keys/{id}", s.adminDeleteKey)
 		r.Get("/usage", s.adminUsage)
+		r.Get("/usage/logs", s.adminUsageLogs)
 		r.Get("/providers", s.adminProviders)
 		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
 	})
@@ -371,6 +372,10 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 		entry.PromptTokens = parsed.Usage.PromptTokens
 		entry.CompletionTokens = parsed.Usage.CompletionTokens
 		entry.TotalTokens = parsed.Usage.TotalTokens
+		if entry.TotalTokens == 0 {
+			// Upstream omitted/zero total: derive from parts.
+			entry.TotalTokens = entry.PromptTokens + entry.CompletionTokens
+		}
 	}
 	for _, h := range []string{"Content-Type", "Cache-Control"} {
 		if v := resp.Header.Get(h); v != "" {
@@ -425,6 +430,9 @@ func (s *srv) relayStream(w http.ResponseWriter, resp *http.Response, entry *usa
 		entry.PromptTokens = u.PromptTokens
 		entry.CompletionTokens = u.CompletionTokens
 		entry.TotalTokens = u.TotalTokens
+		if entry.TotalTokens == 0 {
+			entry.TotalTokens = entry.PromptTokens + entry.CompletionTokens
+		}
 	}
 }
 

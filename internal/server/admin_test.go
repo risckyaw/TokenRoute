@@ -215,6 +215,49 @@ func TestAdmin_UsageAggregate(t *testing.T) {
 	}
 }
 
+func TestAdmin_UsageLogs(t *testing.T) {
+	h, _ := adminSetup(t)
+	// Seed 3 entries via real chat requests (logged by the handler's logger).
+	for i, model := range []string{"m1", "m2", "m3"} {
+		rec := adminReq(t, h, http.MethodPost, "/admin/keys", `{"name":"k`+model+`"}`, testAdminKey)
+		var created auth.Key
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatal(err)
+		}
+		if rec := postChat(t, h, created.Key, "auto"); rec.Code != 200 {
+			t.Fatalf("chat %d: status %d", i, rec.Code)
+		}
+	}
+	rec := adminReq(t, h, http.MethodGet, "/admin/usage/logs?limit=2", "", testAdminKey)
+	if rec.Code != 200 {
+		t.Fatalf("logs: status %d: %s", rec.Code, rec.Body.String())
+	}
+	var entries []usage.Entry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries (limit), got %d", len(entries))
+	}
+	// Newest first: IDs descending.
+	if entries[0].ID <= entries[1].ID {
+		t.Fatalf("order not newest-first: ids %d, %d", entries[0].ID, entries[1].ID)
+	}
+	e := entries[0]
+	if e.RequestID == "" || e.VirtualModel != "auto" || e.Provider != "fake" ||
+		e.Model != "up-model" || e.TotalTokens != 2 || e.Status != 200 {
+		t.Fatalf("entry fields: %+v", e)
+	}
+	// Default limit returns all 3, still newest first.
+	rec = adminReq(t, h, http.MethodGet, "/admin/usage/logs", "", testAdminKey)
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[0].ID < entries[2].ID {
+		t.Fatalf("default limit/order: %+v", entries)
+	}
+}
+
 func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
 }
