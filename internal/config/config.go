@@ -67,6 +67,10 @@ type RouteConfig struct {
 	Strategy   string            `yaml:"strategy"`   // priority|round_robin|least_latency|weighted|cost|lkgp|headroom
 	Multiplier float64           `yaml:"multiplier"` // cost multiplier; default 1.0
 	Candidates []CandidateConfig `yaml:"candidates"`
+	// FallbackRoutes (LiteLLM fallbacks): other virtual models tried, in
+	// order, when every candidate of this route fails retryably. Max 3 route
+	// hops; cycles skipped. Client errors (400/401/403) never trigger it.
+	FallbackRoutes []string `yaml:"fallback_routes"`
 }
 
 // FreeTierConfig is one free-tier budget entry: provider+model gets
@@ -182,6 +186,10 @@ func (c *Config) Validate() error {
 		}
 		seen[p.Name] = true
 	}
+	routeModels := map[string]bool{}
+	for _, r := range c.Routes {
+		routeModels[r.Model] = true
+	}
 	for _, r := range c.Routes {
 		if r.Model == "" {
 			return fmt.Errorf("route with empty model")
@@ -198,6 +206,11 @@ func (c *Config) Validate() error {
 			}
 			if cand.Weight < 0 {
 				return fmt.Errorf("route %q has candidate with negative weight", r.Model)
+			}
+		}
+		for _, fb := range r.FallbackRoutes {
+			if !routeModels[fb] {
+				return fmt.Errorf("route %q fallback_routes references unknown model %q", r.Model, fb)
 			}
 		}
 	}

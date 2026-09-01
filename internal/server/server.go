@@ -568,6 +568,66 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 	return cand, resp, lastFailResp, lastErr, attempts
 }
 
+// runRoute executes the failover (or fusion) loop for one route and, when
+// every candidate fails retryably, follows the route's fallback_routes
+// (LiteLLM fallbacks): other virtual models tried in order, max 3 route
+// hops, cycles skipped via the visited set. Client errors (4xx relayed
+// as-is) never trigger fallback — failoverCtx returns those as resp != nil.
+func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool) {
+	sel := router.ParseTagSelector(tagHeader)
+	visited := map[string]bool{model: true}
+	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
+	for hops := 0; ; hops++ {
+		var at int
+		var lfr *http.Response
+		var le error
+		if strategy == router.StrategyFusion && !stream && len(candidates) > 1 {
+			cand, resp, lfr, le, at = s.fusionRun(ctx, hdr, body, candidates[:2])
+			fused = true
+		} else {
+			cand, resp, lfr, le, at = s.failoverCtx(ctx, hdr, body, candidates, chatCall, estTokens)
+		}
+		attempts += at
+		if lfr != nil {
+			if lastFailResp != nil {
+				lastFailResp.Body.Close()
+			}
+			lastFailResp = lfr
+		}
+		if le != nil {
+			lastErr = le
+		}
+		if resp != nil || cur == nil || hops >= 3 {
+			return cand, resp, lastFailResp, lastErr, attempts, fused
+		}
+		// All candidates failed retryably: try the next fallback route.
+		var next *router.Route
+		for _, name := range cur.FallbackRoutes {
+			if visited[name] {
+				continue
+			}
+			if rt := s.router.Resolve(name); rt != nil {
+				visited[name] = true
+				next = rt
+				break
+			}
+		}
+		if next == nil {
+			return cand, resp, lastFailResp, lastErr, attempts, fused
+		}
+		if sel != nil {
+			next = next.WithTags(sel)
+		}
+		candidates = s.router.OrderCandidates(next)
+		if len(candidates) == 0 {
+			cur = next // skip routes with no usable candidates
+			continue
+		}
+		cur = next
+		strategy = next.Strategy
+	}
+}
+
 // relayAllFailed writes the terminal response when every candidate failed:
 // the last retryable upstream response as-is, else a 502 transport error.
 // When the failure is an upstream 429, the Retry-After header is raised to
@@ -663,12 +723,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var attempts int
 	fused := false
 	est := estimateChatTokens(body)
-	if strategy == router.StrategyFusion && !stream && len(candidates) > 1 {
-		cand, resp, lastFailResp, lastErr, attempts = s.fusionRun(r.Context(), hdr, body, candidates[:2])
-		fused = true
-	} else {
-		cand, resp, lastFailResp, lastErr, attempts = s.failoverCtx(r.Context(), hdr, body, candidates, chatCall, est)
-	}
+	cand, resp, lastFailResp, lastErr, attempts, fused = s.runRoute(r.Context(), hdr, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
 	setDecisionHeader(w, cand, strategy, attempts)
 	if fused {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")

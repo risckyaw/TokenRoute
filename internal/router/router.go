@@ -54,6 +54,9 @@ type Route struct {
 	Strategy   string
 	Multiplier float64     // cost multiplier; 0 -> 1.0
 	Candidates []Candidate // sorted by Provider.Priority() ascending
+	// FallbackRoutes: other virtual models tried when every candidate here
+	// fails retryably (LiteLLM fallbacks); resolved by name at request time.
+	FallbackRoutes []string
 
 	rr       atomic.Uint64 // round-robin counter
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)

@@ -112,7 +112,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	}
 	routes := make([]*router.Route, 0, len(cfg.Routes))
 	for _, rc := range cfg.Routes {
-		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier}
+		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier, FallbackRoutes: rc.FallbackRoutes}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
 				Provider: byName[cc.Provider],
