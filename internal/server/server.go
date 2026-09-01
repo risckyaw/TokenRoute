@@ -237,6 +237,13 @@ func timeoutOverride(next http.Handler) http.Handler {
 	})
 }
 
+// secondsUntilMidnightUTC is the Retry-After hint for daily quota resets.
+func secondsUntilMidnightUTC() int {
+	now := time.Now().UTC()
+	next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	return int(next.Sub(now).Seconds()) + 1
+}
+
 // limitIdentity derives the rate-limit identity for a request: k.ID by
 // default; when k.LimitByHeader is set and the header is present, an FNV-1a
 // hash of "keyID:headerValue" (stable, collision-tolerant for this scale).
@@ -327,6 +334,19 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			writeErr(w, http.StatusPaymentRequired, "USD budget exhausted", "budget_exceeded")
 			return nil, "", nil, nil, "", 1, false
 		}
+		if k.DailyQuota > 0 {
+			remaining := k.DailyQuota - k.DailyUsed
+			if remaining < 0 {
+				remaining = 0
+			}
+			w.Header().Set("X-RateLimit-Daily-Limit", strconv.FormatInt(k.DailyQuota, 10))
+			w.Header().Set("X-RateLimit-Daily-Remaining", strconv.FormatInt(remaining, 10))
+			if k.DailyUsed >= k.DailyQuota {
+				w.Header().Set("Retry-After", strconv.Itoa(secondsUntilMidnightUTC()))
+				writeErr(w, http.StatusTooManyRequests, "daily request quota exceeded", "daily_quota_exceeded")
+				return nil, "", nil, nil, "", 1, false
+			}
+		}
 		if s.limiter != nil {
 			// Rate-limit identity: normally the key ID; when the key has
 			// limit_by_header set, derive a per-header-value identity so one
@@ -360,6 +380,11 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 				w.Header().Set("Retry-After", "60")
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
+			}
+		}
+		if k.DailyQuota > 0 {
+			if err := s.keys.IncrDaily(k.ID); err != nil {
+				slog.Error("incr daily quota", "err", err, "key_id", k.ID)
 			}
 		}
 	}

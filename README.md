@@ -50,7 +50,10 @@ speak one API.
   `X-RateLimit-Token-*` (TPM) response headers; 429s carry `Retry-After`.
   Optional `limit_by_header` on a key derives the rate-limit identity from
   a request header (e.g. `X-User-Id`) so one key serves many end-users
-  with isolated buckets (Kong-style `limit_by`).
+  with isolated buckets (Kong-style `limit_by`). Optional `daily_quota`
+  caps requests per UTC day (persisted, atomic rollover); usage surfaced
+  via `X-RateLimit-Daily-Limit/Remaining`, exhaustion returns 429
+  `daily_quota_exceeded` with `Retry-After` until midnight UTC.
 - **Correlation IDs** — every request gets `X-Correlation-ID` (generated
   when absent, propagated upstream, echoed downstream).
 - **Request size limiting** — Content-Length pre-check rejects oversized

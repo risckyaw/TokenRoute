@@ -20,6 +20,8 @@ type Key struct {
 	TPM           int        `json:"tpm"`          // tokens/min; 0 = unlimited
 	ModelRPM      int        `json:"model_rpm"`    // per-(key,model) requests/min; 0 = use RPM
 	LimitByHeader string     `json:"limit_by_header"` // when set, rate-limit identity = this header's value
+	DailyQuota    int64      `json:"daily_quota"`     // max requests per UTC day; 0 = unlimited
+	DailyUsed     int64      `json:"daily_used"`      // requests used in the current UTC day
 	QuotaTokens   int64      `json:"quota_tokens"` // lifetime cap; 0 = unlimited
 	SpentTokens   int64      `json:"spent_tokens"`
 	BudgetUSD     float64    `json:"budget_usd"` // lifetime USD cap; 0 = unlimited
@@ -89,7 +91,7 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("create api_keys table: %w", err)
 	}
 	// Batch 4/5/6 columns; add only when missing (existing DBs).
-	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0", `groups TEXT DEFAULT ''`, "model_rpm INTEGER DEFAULT 0", "limit_by_header TEXT DEFAULT ''"} {
+	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0", `groups TEXT DEFAULT ''`, "model_rpm INTEGER DEFAULT 0", "limit_by_header TEXT DEFAULT ''", "daily_quota INTEGER DEFAULT 0", "daily_used INTEGER DEFAULT 0", "daily_day TEXT DEFAULT ''"} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "api_keys", name) {
 			if _, err := db.Exec(`ALTER TABLE api_keys ADD COLUMN ` + col); err != nil {
@@ -134,9 +136,9 @@ func (s *Store) Create(k Key) (Key, error) {
 	}
 	k.CreatedAt = time.Now().UTC()
 	res, err := s.db.Exec(`INSERT INTO api_keys
-		(key, name, rpm, tpm, model_rpm, limit_by_header, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, groups, expires_at, enabled, created_at)
-		VALUES (?,?,?,?,?,?,?,0,?,0,?,?,?,?,?)`,
-		k.Key, k.Name, k.RPM, k.TPM, k.ModelRPM, k.LimitByHeader, k.QuotaTokens, k.BudgetUSD, string(models), string(groups), expires, boolInt(k.Enabled),
+		(key, name, rpm, tpm, model_rpm, limit_by_header, daily_quota, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, groups, expires_at, enabled, created_at)
+		VALUES (?,?,?,?,?,?,?,?,0,?,0,?,?,?,?,?)`,
+		k.Key, k.Name, k.RPM, k.TPM, k.ModelRPM, k.LimitByHeader, k.DailyQuota, k.QuotaTokens, k.BudgetUSD, string(models), string(groups), expires, boolInt(k.Enabled),
 		k.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return Key{}, err
@@ -147,7 +149,8 @@ func (s *Store) Create(k Key) (Key, error) {
 
 // GetByKey returns the key row or (nil, nil) when unknown.
 func (s *Store) GetByKey(key string) (*Key, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), COALESCE(limit_by_header,''), quota_tokens, spent_tokens,
+	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), COALESCE(limit_by_header,''),
+		COALESCE(daily_quota,0), COALESCE(daily_used,0), COALESCE(daily_day,''), quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys WHERE key = ?`, key)
 	if err != nil {
@@ -166,7 +169,8 @@ func (s *Store) GetByKey(key string) (*Key, error) {
 
 // List returns all keys, newest first.
 func (s *Store) List() ([]Key, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), COALESCE(limit_by_header,''), quota_tokens, spent_tokens,
+	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, COALESCE(model_rpm,0), COALESCE(limit_by_header,''),
+		COALESCE(daily_quota,0), COALESCE(daily_used,0), COALESCE(daily_day,''), quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
 		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys ORDER BY id DESC`)
 	if err != nil {
@@ -186,12 +190,17 @@ func (s *Store) List() ([]Key, error) {
 
 func scanKey(rows *sql.Rows) (Key, error) {
 	var k Key
-	var models, groups, created string
+	var models, groups, created, dailyDay string
 	var expires sql.NullString
 	var enabled int
-	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.ModelRPM, &k.LimitByHeader, &k.QuotaTokens,
+	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.ModelRPM, &k.LimitByHeader,
+		&k.DailyQuota, &k.DailyUsed, &dailyDay, &k.QuotaTokens,
 		&k.SpentTokens, &k.BudgetUSD, &k.SpentUSD, &models, &groups, &expires, &enabled, &created); err != nil {
 		return Key{}, err
+	}
+	// Reset the daily counter when the UTC day has rolled over.
+	if today := time.Now().UTC().Format("2006-01-02"); dailyDay != today {
+		k.DailyUsed = 0
 	}
 	_ = json.Unmarshal([]byte(models), &k.AllowedModels)
 	_ = json.Unmarshal([]byte(groups), &k.Groups)
@@ -226,6 +235,17 @@ func (s *Store) SpendTokens(id int64, n int) error {
 // SpendUSD adds amount to the key's spent_usd counter.
 func (s *Store) SpendUSD(id int64, amount float64) error {
 	_, err := s.db.Exec(`UPDATE api_keys SET spent_usd = spent_usd + ? WHERE id = ?`, amount, id)
+	return err
+}
+
+// IncrDaily atomically increments the daily request counter, resetting it
+// first when the stored day differs from today (UTC).
+func (s *Store) IncrDaily(id int64) error {
+	today := time.Now().UTC().Format("2006-01-02")
+	_, err := s.db.Exec(`UPDATE api_keys SET
+		daily_used = CASE WHEN daily_day = ? THEN daily_used + 1 ELSE 1 END,
+		daily_day = ?
+		WHERE id = ?`, today, today, id)
 	return err
 }
 
