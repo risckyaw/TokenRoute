@@ -39,40 +39,59 @@ type serverState struct {
 	adminKey string
 	cache    *server.RespCache
 	metrics  *metrics.Registry
+	// streamIdleMs is the per-provider stream idle timeout (provider name -> ms).
+	streamIdleMs map[string]int
 }
 
 func buildState(cfg *config.Config) (*serverState, error) {
 	provs := make([]provider.Provider, 0, len(cfg.Providers))
 	byName := map[string]provider.Provider{}
+	sit := map[string]int{} // stream idle timeout ms per provider name
+	mappings := map[string]map[string]string{}
 	for _, pc := range cfg.Providers {
+		// ponytail: 0 means "unset" here, so an explicit 0 in YAML also gets
+		// the default; use a huge value to effectively disable, or switch to
+		// *int when a real disable knob is needed.
+		rhtMs := pc.ResponseHeaderTimeoutMs
+		if rhtMs == 0 {
+			rhtMs = 900000 // 15min default
+		}
+		sitMs := pc.StreamIdleTimeoutMs
+		if sitMs == 0 {
+			sitMs = 300000 // 5min default
+		}
+		sit[pc.Name], mappings[pc.Name] = sitMs, pc.ModelMapping
 		var p provider.Provider
 		switch pc.Type {
 		case "openai", "":
 			p = openai.New(openai.Config{
-				Name:      pc.Name,
-				BaseURL:   pc.BaseURL,
-				APIKey:    pc.APIKey,
-				APIKeys:   pc.APIKeys,
-				Priority:  pc.Priority,
-				TimeoutMs: pc.TimeoutMs,
+				Name:                    pc.Name,
+				BaseURL:                 pc.BaseURL,
+				APIKey:                  pc.APIKey,
+				APIKeys:                 pc.APIKeys,
+				Priority:                pc.Priority,
+				TimeoutMs:               pc.TimeoutMs,
+				ResponseHeaderTimeoutMs: rhtMs,
 			})
 		case "anthropic":
 			p = anthropic.New(anthropic.Config{
-				Name:      pc.Name,
-				BaseURL:   pc.BaseURL,
-				APIKey:    pc.APIKey,
-				APIKeys:   pc.APIKeys,
-				Priority:  pc.Priority,
-				TimeoutMs: pc.TimeoutMs,
+				Name:                    pc.Name,
+				BaseURL:                 pc.BaseURL,
+				APIKey:                  pc.APIKey,
+				APIKeys:                 pc.APIKeys,
+				Priority:                pc.Priority,
+				TimeoutMs:               pc.TimeoutMs,
+				ResponseHeaderTimeoutMs: rhtMs,
 			})
 		case "gemini":
 			p = gemini.New(gemini.Config{
-				Name:      pc.Name,
-				BaseURL:   pc.BaseURL,
-				APIKey:    pc.APIKey,
-				APIKeys:   pc.APIKeys,
-				Priority:  pc.Priority,
-				TimeoutMs: pc.TimeoutMs,
+				Name:                    pc.Name,
+				BaseURL:                 pc.BaseURL,
+				APIKey:                  pc.APIKey,
+				APIKeys:                 pc.APIKeys,
+				Priority:                pc.Priority,
+				TimeoutMs:               pc.TimeoutMs,
+				ResponseHeaderTimeoutMs: rhtMs,
 			})
 		default:
 			return nil, fmt.Errorf("unknown provider type %q for %q", pc.Type, pc.Name)
@@ -88,6 +107,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 				Provider: byName[cc.Provider],
 				Model:    cc.Model,
 				Weight:   cc.Weight,
+				Groups:   cc.Groups,
 			})
 		}
 		routes = append(routes, rt)
@@ -98,6 +118,9 @@ func buildState(cfg *config.Config) (*serverState, error) {
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
+	for name, m := range mappings {
+		rt.SetModelMapping(name, m)
+	}
 	for _, pc := range cfg.Providers {
 		if pc.Circuit != nil {
 			rt.SetCircuit(pc.Name, router.CircuitConfig{
@@ -106,7 +129,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 			})
 		}
 	}
-	return &serverState{router: rt, prices: prices}, nil
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit}, nil
 }
 
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
@@ -186,6 +209,7 @@ func main() {
 			Cache:         st.cache,
 			Metrics:       st.metrics,
 			SeparateAdmin: cfg.AdminListen != "",
+			StreamIdleMs:  st.streamIdleMs,
 		}).ServeHTTP(w, r)
 	})
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler}

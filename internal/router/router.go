@@ -39,7 +39,8 @@ const emaAlpha = 0.3
 type Candidate struct {
 	Provider provider.Provider
 	Model    string
-	Weight   int // used by the weighted strategy; defaults to 1
+	Weight   int      // used by the weighted strategy; defaults to 1
+	Groups   []string // empty = usable by every key group
 }
 
 type Route struct {
@@ -67,6 +68,7 @@ type Router struct {
 	circuits  map[string]*CircuitBreaker
 	latency   map[string]float64 // EMA latency ms per provider name
 	prices    map[string]usage.Price
+	mappings  map[string]map[string]string // provider name -> alias -> upstream model
 	latMu     sync.Mutex
 	lockMu    sync.Mutex
 	modelLock map[string]time.Time // provider|model -> locked until
@@ -114,6 +116,29 @@ func (r *Router) SetCircuit(providerName string, cfg CircuitConfig) {
 // SetPrices installs the price map used by the cost strategy.
 func (r *Router) SetPrices(prices map[string]usage.Price) {
 	r.prices = prices
+}
+
+// SetModelMapping installs a provider's alias -> upstream-model map
+// (applied after route resolution, before the provider call).
+func (r *Router) SetModelMapping(providerName string, m map[string]string) {
+	if len(m) == 0 {
+		return
+	}
+	if r.mappings == nil {
+		r.mappings = map[string]map[string]string{}
+	}
+	r.mappings[providerName] = m
+}
+
+// MapModel resolves a provider's model alias to its upstream model
+// (identity when unmapped).
+func (r *Router) MapModel(providerName, model string) string {
+	if m, ok := r.mappings[providerName]; ok {
+		if up, ok := m[model]; ok {
+			return up
+		}
+	}
+	return model
 }
 
 // circuitAllow reports whether the provider's circuit permits a request
@@ -339,4 +364,17 @@ func (r *Router) RouteModels() []string {
 		out = append(out, rt.Model)
 	}
 	return out
+}
+
+// FirstModelFor returns the first candidate upstream model configured for a
+// provider across all routes ("" when none) — used by the admin channel test.
+func (r *Router) FirstModelFor(providerName string) string {
+	for _, rt := range r.routes {
+		for _, c := range rt.Candidates {
+			if c.Provider.Name() == providerName {
+				return c.Model
+			}
+		}
+	}
+	return ""
 }

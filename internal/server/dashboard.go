@@ -502,8 +502,22 @@ async function loadProviders() {
     "<tr><td class='mono'>" + esc(p.name) + "</td><td class='n'>" + p.priority + "</td>" +
     "<td class='n'>" + Math.round(p.ema_latency_ms || 0) + "</td>" +
     "<td><span class='pill " + esc(p.circuit) + "'>" + esc(p.circuit) + "</span></td>" +
-    "<td><button class='btn sm' onclick='resetCircuit(\"" + esc(p.name).replace(/"/g, "&quot;") + "\")'>Reset circuit</button></td></tr>"
+    "<td><button class='btn sm' onclick='testProvider(\"" + esc(p.name).replace(/"/g, "&quot;") + "\", this)'>Test</button> " +
+    "<button class='btn sm' onclick='resetCircuit(\"" + esc(p.name).replace(/"/g, "&quot;") + "\")'>Reset circuit</button></td></tr>"
   ).join("") : emptyRow(5, "No providers configured.");
+}
+
+async function testProvider(name, btn) {
+  btn.disabled = true; btn.textContent = "Testing...";
+  try {
+    const r = await api("/admin/providers/" + encodeURIComponent(name) + "/test", {method:"POST"});
+    btn.textContent = r.ok ? ("OK " + r.latency_ms + "ms") : ("FAIL " + (r.status || ""));
+    btn.style.color = r.ok ? "var(--ok,#34D399)" : "var(--red,#EF4444)";
+    setTimeout(() => { btn.disabled = false; btn.textContent = "Test"; btn.style.color = ""; }, 5000);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "Test";
+    showErr(e.auth ? "Unauthorized. Re-enter the admin key above." : e.message);
+  }
 }
 
 async function resetCircuit(name) {

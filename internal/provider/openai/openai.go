@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 )
@@ -21,6 +20,9 @@ type Config struct {
 	APIKeys   []string // pool; APIKey appended when set
 	Priority  int
 	TimeoutMs int
+	// ResponseHeaderTimeoutMs bounds the wait for response headers only
+	// (0 = disabled); streaming bodies are unaffected.
+	ResponseHeaderTimeoutMs int
 }
 
 type Provider struct {
@@ -32,10 +34,6 @@ type Provider struct {
 }
 
 func New(cfg Config) *Provider {
-	timeout := time.Duration(cfg.TimeoutMs) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 120 * time.Second
-	}
 	keys := append([]string(nil), cfg.APIKeys...)
 	if cfg.APIKey != "" {
 		keys = append(keys, cfg.APIKey)
@@ -45,7 +43,7 @@ func New(cfg Config) *Provider {
 		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
 		pool:     provider.NewKeyPool(keys...),
 		priority: cfg.Priority,
-		client:   &http.Client{Timeout: timeout},
+		client:   provider.NewHTTPClient(cfg.TimeoutMs, cfg.ResponseHeaderTimeoutMs),
 	}
 }
 

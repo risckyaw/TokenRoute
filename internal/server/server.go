@@ -71,6 +71,9 @@ type Options struct {
 	// SeparateAdmin, when true, removes /admin routes from this handler —
 	// they are served by NewAdminOnly on a dedicated listener.
 	SeparateAdmin bool
+	// StreamIdleMs aborts a streaming relay after N ms without upstream
+	// bytes, per provider name (missing/0 = disabled).
+	StreamIdleMs map[string]int
 }
 
 // New builds the handler. Kept for compatibility: auth disabled.
@@ -80,7 +83,8 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
-		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics}
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
+		streamIdleMs: o.StreamIdleMs}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
@@ -103,7 +107,8 @@ func NewWithOptions(o Options) http.Handler {
 // NewAdminOnly serves only /admin routes (dedicated admin listener).
 func NewAdminOnly(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
-		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, metrics: o.Metrics}
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, metrics: o.Metrics,
+		streamIdleMs: o.StreamIdleMs}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
@@ -126,6 +131,7 @@ func (s *srv) registerAdmin(mux chi.Router) {
 		r.Get("/usage/logs", s.adminUsageLogs)
 		r.Get("/usage/export", s.adminUsageExport)
 		r.Get("/providers", s.adminProviders)
+		r.Post("/providers/{name}/test", s.adminProviderTest)
 		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
 	})
 }
@@ -139,6 +145,8 @@ type srv struct {
 	adminKey string
 	cache    *RespCache
 	metrics  *metrics.Registry
+	// streamIdleMs: per-provider stream idle timeout (provider name -> ms).
+	streamIdleMs map[string]int
 }
 
 // metricsHandler serves GET /metrics (Prometheus text exposition, no auth).
@@ -310,7 +318,38 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 		writeErr(w, http.StatusBadRequest, "no provider available for model: "+model, "invalid_request_error")
 		return nil, "", nil, nil, "", false
 	}
+	// Group access: drop candidates whose groups don't intersect the key's
+	// groups (empty on either side = wildcard).
+	if k != nil && len(k.Groups) > 0 {
+		filtered := candidates[:0]
+		for _, c := range candidates {
+			if groupsIntersect(k.Groups, c.Groups) {
+				filtered = append(filtered, c)
+			}
+		}
+		candidates = filtered
+		if len(candidates) == 0 {
+			writeErr(w, http.StatusForbidden, "no available channel for your group", "group_forbidden")
+			return nil, "", nil, nil, "", false
+		}
+	}
 	return body, model, k, candidates, strategy, true
+}
+
+// groupsIntersect reports whether any group appears in both lists
+// (an empty list is a wildcard matching everything).
+func groupsIntersect(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return true
+	}
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // failover tries candidates in order with the given call; each tried at most
@@ -327,6 +366,10 @@ func (s *srv) failover(ctx context.Context, hdr http.Header, body []byte, candid
 func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, candidates []router.Candidate, call callFn, estTokens int) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
 	for _, c := range candidates {
 		cand = c
+		// Model mapping: alias -> upstream model, per provider, applied after
+		// route resolution so the decision header and usage log see the final
+		// upstream model.
+		cand.Model = s.router.MapModel(c.Provider.Name(), c.Model)
 		if estTokens > 0 {
 			if p, ok := s.prices[c.Model]; ok && p.ContextTokens > 0 && estTokens > p.ContextTokens {
 				lastErr = errContextExceeded // local rejection; try next candidate
@@ -334,7 +377,7 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 			}
 		}
 		attemptStart := time.Now()
-		req := &provider.Request{Model: c.Model, Body: body, Header: hdr}
+		req := &provider.Request{Model: cand.Model, Body: body, Header: hdr}
 		att, err := call(ctx, c.Provider, req)
 		attempts++
 		if err != nil {

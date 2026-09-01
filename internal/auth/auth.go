@@ -23,6 +23,7 @@ type Key struct {
 	BudgetUSD     float64    `json:"budget_usd"` // lifetime USD cap; 0 = unlimited
 	SpentUSD      float64    `json:"spent_usd"`
 	AllowedModels []string   `json:"allowed_models"` // empty = all
+	Groups        []string   `json:"groups"`         // empty = all candidate groups usable
 	ExpiresAt     *time.Time `json:"expires_at"`
 	Enabled       bool       `json:"enabled"`
 	CreatedAt     time.Time  `json:"created_at"`
@@ -58,8 +59,8 @@ func NewStore(db *sql.DB) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("create api_keys table: %w", err)
 	}
-	// Batch 4 columns; add only when missing (existing DBs).
-	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0"} {
+	// Batch 4/5 columns; add only when missing (existing DBs).
+	for _, col := range []string{"budget_usd REAL DEFAULT 0", "spent_usd REAL DEFAULT 0", `groups TEXT DEFAULT ''`} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "api_keys", name) {
 			if _, err := db.Exec(`ALTER TABLE api_keys ADD COLUMN ` + col); err != nil {
@@ -94,15 +95,19 @@ func (s *Store) Create(k Key) (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
+	groups, err := json.Marshal(k.Groups)
+	if err != nil {
+		return Key{}, err
+	}
 	var expires any
 	if k.ExpiresAt != nil {
 		expires = k.ExpiresAt.UTC().Format(time.RFC3339Nano)
 	}
 	k.CreatedAt = time.Now().UTC()
 	res, err := s.db.Exec(`INSERT INTO api_keys
-		(key, name, rpm, tpm, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, expires_at, enabled, created_at)
-		VALUES (?,?,?,?,?,0,?,0,?,?,?,?)`,
-		k.Key, k.Name, k.RPM, k.TPM, k.QuotaTokens, k.BudgetUSD, string(models), expires, boolInt(k.Enabled),
+		(key, name, rpm, tpm, quota_tokens, spent_tokens, budget_usd, spent_usd, allowed_models, groups, expires_at, enabled, created_at)
+		VALUES (?,?,?,?,?,0,?,0,?,?,?,?,?)`,
+		k.Key, k.Name, k.RPM, k.TPM, k.QuotaTokens, k.BudgetUSD, string(models), string(groups), expires, boolInt(k.Enabled),
 		k.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return Key{}, err
@@ -115,7 +120,7 @@ func (s *Store) Create(k Key) (Key, error) {
 func (s *Store) GetByKey(key string) (*Key, error) {
 	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
-		allowed_models, expires_at, enabled, created_at FROM api_keys WHERE key = ?`, key)
+		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys WHERE key = ?`, key)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +139,7 @@ func (s *Store) GetByKey(key string) (*Key, error) {
 func (s *Store) List() ([]Key, error) {
 	rows, err := s.db.Query(`SELECT id, key, name, rpm, tpm, quota_tokens, spent_tokens,
 		COALESCE(budget_usd,0), COALESCE(spent_usd,0),
-		allowed_models, expires_at, enabled, created_at FROM api_keys ORDER BY id DESC`)
+		allowed_models, COALESCE(groups,''), expires_at, enabled, created_at FROM api_keys ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -152,14 +157,15 @@ func (s *Store) List() ([]Key, error) {
 
 func scanKey(rows *sql.Rows) (Key, error) {
 	var k Key
-	var models, created string
+	var models, groups, created string
 	var expires sql.NullString
 	var enabled int
 	if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.RPM, &k.TPM, &k.QuotaTokens,
-		&k.SpentTokens, &k.BudgetUSD, &k.SpentUSD, &models, &expires, &enabled, &created); err != nil {
+		&k.SpentTokens, &k.BudgetUSD, &k.SpentUSD, &models, &groups, &expires, &enabled, &created); err != nil {
 		return Key{}, err
 	}
 	_ = json.Unmarshal([]byte(models), &k.AllowedModels)
+	_ = json.Unmarshal([]byte(groups), &k.Groups)
 	k.Enabled = enabled != 0
 	k.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	if expires.Valid {

@@ -52,6 +52,17 @@ speak one API.
   provider circuits), 5s auto-refresh.
 - **Hot reload** — SIGHUP reloads config without dropping requests.
 - **Distroless Docker image** — multi-stage, nonroot, CGO-free.
+- **Group-based access** — keys and route candidates carry `groups`; a key only
+  reaches candidates sharing a group (empty side = wildcard, else 403
+  `group_forbidden`).
+- **Model mapping** — per-provider `model_mapping` rewrites route models to
+  upstream aliases; decision header and usage log record the final model.
+- **Upstream hardening** — `response_header_timeout_ms` bounds the wait for
+  upstream headers without cutting streams; `stream_idle_timeout_ms` cuts SSE
+  streams that go silent.
+- **Channel test** — `POST /admin/providers/{name}/test` sends a minimal
+  completion through the provider (status + latency), wired to a Test button
+  in the dashboard.
 
 ## Quickstart
 

@@ -22,6 +22,14 @@ providers:
     # Optional per-provider circuit breaker (defaults shown):
     # opens after N consecutive failures, cools down, then allows 1 probe.
     circuit: {failure_threshold: 3, cooldown_ms: 30000}
+    # Bounds ONLY the wait for upstream response headers (default 15min).
+    # Streaming after headers arrive is unaffected. 0 = default.
+    #response_header_timeout_ms: 900000
+    # Max silence between SSE chunks before the stream is cut (default 5min).
+    #stream_idle_timeout_ms: 300000
+    # Per-provider model aliases: client/route model -> actual upstream model.
+    #model_mapping:
+    #  gpt-4o: deepseek-chat
 
   - name: deepseek
     type: openai                    # openai-compatible API
@@ -68,6 +76,9 @@ routes:
     candidates:
       - provider: deepseek
         model: deepseek-chat
+        # Optional group tags; keys with groups: ["team-x"] only reach
+        # candidates sharing a group (empty on either side = wildcard).
+        #groups: [team-x]
       - provider: openai
         model: gpt-4o-mini
 

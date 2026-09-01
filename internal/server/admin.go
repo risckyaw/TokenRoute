@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
+	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/usage"
 )
 
@@ -55,7 +58,7 @@ func masked(k auth.Key) map[string]any {
 		"id": k.ID, "key": m, "name": k.Name, "rpm": k.RPM, "tpm": k.TPM,
 		"quota_tokens": k.QuotaTokens, "spent_tokens": k.SpentTokens,
 		"budget_usd": k.BudgetUSD, "spent_usd": k.SpentUSD,
-		"allowed_models": k.AllowedModels, "expires_at": k.ExpiresAt,
+		"allowed_models": k.AllowedModels, "groups": k.Groups, "expires_at": k.ExpiresAt,
 		"enabled": k.Enabled, "created_at": k.CreatedAt,
 	}
 }
@@ -67,6 +70,7 @@ type createKeyReq struct {
 	QuotaTokens   int64    `json:"quota_tokens"`
 	BudgetUSD     float64  `json:"budget_usd"`
 	AllowedModels []string `json:"allowed_models"`
+	Groups        []string `json:"groups"`
 	ExpiresAt     *string  `json:"expires_at"` // RFC3339
 }
 
@@ -83,7 +87,7 @@ func (s *srv) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 	k := auth.Key{
 		Name: req.Name, RPM: req.RPM, TPM: req.TPM,
 		QuotaTokens: req.QuotaTokens, BudgetUSD: req.BudgetUSD,
-		AllowedModels: req.AllowedModels, Enabled: true,
+		AllowedModels: req.AllowedModels, Groups: req.Groups, Enabled: true,
 	}
 	if req.ExpiresAt != nil && *req.ExpiresAt != "" {
 		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
@@ -266,4 +270,58 @@ func (s *srv) adminCircuitReset(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	s.router.ResetCircuit(name)
 	writeJSON(w, http.StatusOK, map[string]any{"provider": name, "circuit": s.router.CircuitState(name)})
+}
+
+// adminProviderTest sends a minimal chat completion through the provider to
+// verify reachability + auth, returning status and latency.
+func (s *srv) adminProviderTest(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	var target provider.Provider
+	for _, p := range s.router.Providers() {
+		if p.Name() == name {
+			target = p
+			break
+		}
+	}
+	if target == nil {
+		writeErr(w, http.StatusNotFound, "unknown provider: "+name, "invalid_request_error")
+		return
+	}
+
+	model := ""
+	ctx0, cancel0 := context.WithTimeout(r.Context(), 5*time.Second)
+	if ms, err := target.Models(ctx0); err == nil && len(ms) > 0 {
+		model = ms[0]
+	}
+	cancel0()
+	if model == "" {
+		model = s.router.FirstModelFor(name)
+	}
+	if model == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "no model available to test"})
+		return
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      model,
+		"max_tokens": 1,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+	})
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	resp, err := target.ChatComplete(ctx, &provider.Request{Model: model, Body: body})
+	lat := time.Since(start).Milliseconds()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": 0, "latency_ms": lat, "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status":     resp.StatusCode,
+		"latency_ms": lat,
+		"error":      "",
+	})
 }

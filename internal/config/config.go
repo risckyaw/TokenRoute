@@ -15,20 +15,31 @@ type CircuitConfig struct {
 }
 
 type ProviderConfig struct {
-	Name      string         `yaml:"name"`
-	Type      string         `yaml:"type"`
-	BaseURL   string         `yaml:"base_url"`
-	APIKey    string         `yaml:"api_key"`
-	APIKeys   []string       `yaml:"api_keys"` // pool; api_key still works (pool of 1)
-	Priority  int            `yaml:"priority"`
-	TimeoutMs int            `yaml:"timeout_ms"`
-	Circuit   *CircuitConfig `yaml:"circuit"`
+	Name      string   `yaml:"name"`
+	Type      string   `yaml:"type"`
+	BaseURL   string   `yaml:"base_url"`
+	APIKey    string   `yaml:"api_key"`
+	APIKeys   []string `yaml:"api_keys"` // pool; api_key still works (pool of 1)
+	Priority  int      `yaml:"priority"`
+	TimeoutMs int      `yaml:"timeout_ms"`
+	// ResponseHeaderTimeoutMs bounds the wait for upstream response headers
+	// (0 = disabled; main.go applies the 900000 default when unset).
+	// Streaming bodies unaffected.
+	ResponseHeaderTimeoutMs int `yaml:"response_header_timeout_ms"`
+	// StreamIdleTimeoutMs aborts a streaming relay after this long without
+	// upstream bytes (0 = disabled; main.go applies the 300000 default).
+	StreamIdleTimeoutMs int `yaml:"stream_idle_timeout_ms"`
+	// ModelMapping rewrites candidate model names to upstream models,
+	// applied after route resolution (alias -> upstream model).
+	ModelMapping map[string]string `yaml:"model_mapping"`
+	Circuit      *CircuitConfig    `yaml:"circuit"`
 }
 
 type CandidateConfig struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
-	Weight   int    `yaml:"weight"` // weighted strategy; default 1
+	Provider string   `yaml:"provider"`
+	Model    string   `yaml:"model"`
+	Weight   int      `yaml:"weight"` // weighted strategy; default 1
+	Groups   []string `yaml:"groups"` // empty = all key groups allowed
 }
 
 type RouteConfig struct {

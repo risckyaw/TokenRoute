@@ -27,6 +27,9 @@ type Config struct {
 	APIKeys   []string // pool; APIKey appended when set
 	Priority  int
 	TimeoutMs int
+	// ResponseHeaderTimeoutMs bounds the wait for response headers only
+	// (0 = disabled); streaming bodies are unaffected.
+	ResponseHeaderTimeoutMs int
 }
 
 type Provider struct {
@@ -38,10 +41,6 @@ type Provider struct {
 }
 
 func New(cfg Config) *Provider {
-	timeout := time.Duration(cfg.TimeoutMs) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 120 * time.Second
-	}
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" {
 		base = defaultBaseURL
@@ -55,7 +54,7 @@ func New(cfg Config) *Provider {
 		baseURL:  base,
 		pool:     provider.NewKeyPool(keys...),
 		priority: cfg.Priority,
-		client:   &http.Client{Timeout: timeout},
+		client:   provider.NewHTTPClient(cfg.TimeoutMs, cfg.ResponseHeaderTimeoutMs),
 	}
 }
 
