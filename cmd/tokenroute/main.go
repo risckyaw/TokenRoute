@@ -119,6 +119,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 				Model:    cc.Model,
 				Weight:   cc.Weight,
 				Groups:   cc.Groups,
+				Tags:     cc.Tags,
 			})
 		}
 		routes = append(routes, rt)

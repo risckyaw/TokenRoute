@@ -425,6 +425,11 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 
 	mult = 1
 	if rt := s.router.Resolve(model); rt != nil {
+		// Tag-based routing (LiteLLM tag_based_routing): X-Route-Tags header,
+		// comma-separated; plain = subset match, !tag excludes, &tag requires.
+		if sel := router.ParseTagSelector(r.Header.Get("X-Route-Tags")); sel != nil {
+			rt = rt.WithTags(sel)
+		}
 		candidates = s.router.OrderCandidates(rt)
 		strategy = rt.Strategy
 		mult = rt.Multiplier
@@ -1045,7 +1050,7 @@ func filterHeaders(h http.Header) http.Header {
 		case "Authorization", "Content-Length", "Content-Type", "Connection",
 			"Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te",
 			"Trailer", "Transfer-Encoding", "Upgrade", "Host",
-			"X-Timeout-Ms", "X-Max-Cost-Usd": // gateway-local controls
+			"X-Timeout-Ms", "X-Max-Cost-Usd", "X-Route-Tags": // gateway-local controls
 			continue
 		}
 		out[k] = append([]string(nil), vs...)

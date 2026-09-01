@@ -59,6 +59,7 @@ type CandidateConfig struct {
 	Model    string   `yaml:"model"`
 	Weight   int      `yaml:"weight"` // weighted strategy; default 1
 	Groups   []string `yaml:"groups"` // empty = all key groups allowed
+	Tags     []string `yaml:"tags"`   // tag-routing labels (X-Route-Tags header); empty = matches all
 }
 
 type RouteConfig struct {

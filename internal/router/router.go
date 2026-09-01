@@ -46,6 +46,7 @@ type Candidate struct {
 	Model    string
 	Weight   int      // used by the weighted strategy; defaults to 1
 	Groups   []string // empty = usable by every key group
+	Tags     []string // tag-routing labels; empty = matches all plain/! selectors
 }
 
 type Route struct {
@@ -58,6 +59,26 @@ type Route struct {
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)
 	mu       sync.Mutex    // guards rand source for weighted
 	randSrc  *rand.Rand
+	tags     atomic.Value  // *TagSelector: request-scoped, set via WithTags
+}
+
+// WithTags returns a shallow copy of the route carrying a request-scoped tag
+// selector; OrderCandidates filters on it (the shared route stays selector-free).
+func (rt *Route) WithTags(sel *TagSelector) *Route {
+	if sel == nil {
+		return rt
+	}
+	cp := *rt
+	cp.tags.Store(sel)
+	return &cp
+}
+
+// TagSelector returns the request-scoped selector (nil = no filtering).
+func (rt *Route) TagSelector() *TagSelector {
+	if sel, ok := rt.tags.Load().(*TagSelector); ok {
+		return sel
+	}
+	return nil
 }
 
 // window is a 60s tumbling counter used by the headroom strategy.
@@ -233,8 +254,12 @@ func (r *Router) IsModelLocked(providerName, model string) bool {
 // excluding providers whose circuit is open (half-open allows the probe)
 // and candidates under a per-model lockout.
 func (r *Router) OrderCandidates(rt *Route) []Candidate {
+	sel := rt.TagSelector()
 	allowed := make([]Candidate, 0, len(rt.Candidates))
 	for _, c := range rt.Candidates {
+		if !sel.MatchTags(c.Tags) {
+			continue
+		}
 		if r.circuitAllow(c.Provider.Name()) && !r.IsModelLocked(c.Provider.Name(), c.Model) {
 			allowed = append(allowed, c)
 		}
