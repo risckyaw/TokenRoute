@@ -69,6 +69,7 @@ type createKeyReq struct {
 	RPM           int      `json:"rpm"`
 	TPM           int      `json:"tpm"`
 	ModelRPM      int      `json:"model_rpm"`
+	LimitByHeader string   `json:"limit_by_header"`
 	QuotaTokens   int64    `json:"quota_tokens"`
 	BudgetUSD     float64  `json:"budget_usd"`
 	AllowedModels []string `json:"allowed_models"`
@@ -88,6 +89,7 @@ func (s *srv) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	k := auth.Key{
 		Name: req.Name, RPM: req.RPM, TPM: req.TPM, ModelRPM: req.ModelRPM,
+		LimitByHeader: req.LimitByHeader,
 		QuotaTokens: req.QuotaTokens, BudgetUSD: req.BudgetUSD,
 		AllowedModels: req.AllowedModels, Groups: req.Groups, Enabled: true,
 	}

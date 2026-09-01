@@ -48,6 +48,9 @@ speak one API.
   model allowlists, expiry; full admin API. Rate limits surfaced via
   `RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset` (RPM) and
   `X-RateLimit-Token-*` (TPM) response headers; 429s carry `Retry-After`.
+  Optional `limit_by_header` on a key derives the rate-limit identity from
+  a request header (e.g. `X-User-Id`) so one key serves many end-users
+  with isolated buckets (Kong-style `limit_by`).
 - **Correlation IDs** — every request gets `X-Correlation-ID` (generated
   when absent, propagated upstream, echoed downstream).
 - **Provider adapters** — [OI]-compatible (DeepSeek, OpenRouter, Ollama...),

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -235,6 +236,22 @@ func timeoutOverride(next http.Handler) http.Handler {
 	})
 }
 
+// limitIdentity derives the rate-limit identity for a request: k.ID by
+// default; when k.LimitByHeader is set and the header is present, an FNV-1a
+// hash of "keyID:headerValue" (stable, collision-tolerant for this scale).
+func limitIdentity(k *auth.Key, r *http.Request) int64 {
+	if k.LimitByHeader == "" {
+		return k.ID
+	}
+	v := r.Header.Get(k.LimitByHeader)
+	if v == "" {
+		return k.ID
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strconv.FormatInt(k.ID, 10) + ":" + v))
+	return int64(h.Sum64() & 0x7fffffffffffffff)
+}
+
 func modelAllowed(k *auth.Key, model string) bool {
 	if len(k.AllowedModels) == 0 {
 		return true
@@ -310,31 +327,35 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			return nil, "", nil, nil, "", 1, false
 		}
 		if s.limiter != nil {
+			// Rate-limit identity: normally the key ID; when the key has
+			// limit_by_header set, derive a per-header-value identity so one
+			// key serves many end-users with isolated buckets (Kong limit_by).
+			limID := limitIdentity(k, r)
 			rpmLimit := k.RPM
 			if k.ModelRPM > 0 {
 				rpmLimit = k.ModelRPM
 			}
 			if rpmLimit > 0 {
 				w.Header().Set("RateLimit-Limit", strconv.Itoa(rpmLimit))
-				w.Header().Set("RateLimit-Remaining", strconv.Itoa(s.limiter.RPMRemaining(k.ID, rpmLimit)))
+				w.Header().Set("RateLimit-Remaining", strconv.Itoa(s.limiter.RPMRemaining(limID, rpmLimit)))
 				w.Header().Set("RateLimit-Reset", strconv.Itoa(60))
 			}
 			if k.TPM > 0 {
 				w.Header().Set("X-RateLimit-Token-Limit", strconv.Itoa(k.TPM))
-				w.Header().Set("X-RateLimit-Token-Remaining", strconv.Itoa(s.limiter.TPMRemaining(k.ID, k.TPM)))
+				w.Header().Set("X-RateLimit-Token-Remaining", strconv.Itoa(s.limiter.TPMRemaining(limID, k.TPM)))
 			}
 			if k.ModelRPM > 0 {
-				if !s.limiter.AllowModelRPM(k.ID, model, k.ModelRPM) {
+				if !s.limiter.AllowModelRPM(limID, model, k.ModelRPM) {
 					w.Header().Set("Retry-After", "60")
 					writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 					return nil, "", nil, nil, "", 1, false
 				}
-			} else if !s.limiter.AllowRPM(k.ID, k.RPM) {
+			} else if !s.limiter.AllowRPM(limID, k.RPM) {
 				w.Header().Set("Retry-After", "60")
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
 			}
-			if s.limiter.TPMRemaining(k.ID, k.TPM) <= 0 {
+			if s.limiter.TPMRemaining(limID, k.TPM) <= 0 {
 				w.Header().Set("Retry-After", "60")
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
@@ -601,7 +622,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {
-			s.limiter.DeductTPM(k.ID, k.TPM, entry.TotalTokens)
+			s.limiter.DeductTPM(limitIdentity(k, r), k.TPM, entry.TotalTokens)
 		}
 		if err := s.keys.SpendTokens(k.ID, entry.TotalTokens); err != nil {
 			slog.Error("spend tokens", "err", err, "key_id", k.ID)
@@ -677,7 +698,7 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {
-			s.limiter.DeductTPM(k.ID, k.TPM, entry.TotalTokens)
+			s.limiter.DeductTPM(limitIdentity(k, r), k.TPM, entry.TotalTokens)
 		}
 		if err := s.keys.SpendTokens(k.ID, entry.TotalTokens); err != nil {
 			slog.Error("spend tokens", "err", err, "key_id", k.ID)
