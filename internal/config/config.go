@@ -71,6 +71,9 @@ type RouteConfig struct {
 	// order, when every candidate of this route fails retryably. Max 3 route
 	// hops; cycles skipped. Client errors (400/401/403) never trigger it.
 	FallbackRoutes []string `yaml:"fallback_routes"`
+	// PromptCacheAffinity pins cacheable prompt prefixes to the provider that
+	// served them (provider-side prompt cache hits); overrides global default.
+	PromptCacheAffinity bool `yaml:"prompt_cache_affinity"`
 }
 
 // FreeTierConfig is one free-tier budget entry: provider+model gets
@@ -129,6 +132,9 @@ type Config struct {
 	// "deepseek-chat" -> "ds/deepseek-v4-flash". Per-provider model_mapping
 	// still applies after route resolution.
 	Aliases map[string]string `yaml:"aliases"`
+	// PromptCacheAffinity (global default, routes may override): pin
+	// cacheable prompt prefixes to the serving provider+model for 1h.
+	PromptCacheAffinity bool `yaml:"prompt_cache_affinity"`
 }
 
 func Load(path string) (*Config, error) {

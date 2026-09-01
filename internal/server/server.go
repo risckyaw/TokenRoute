@@ -573,10 +573,18 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 // (LiteLLM fallbacks): other virtual models tried in order, max 3 route
 // hops, cycles skipped via the visited set. Client errors (4xx relayed
 // as-is) never trigger fallback — failoverCtx returns those as resp != nil.
-func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool) {
+func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, affinityHit bool) {
 	sel := router.ParseTagSelector(tagHeader)
 	visited := map[string]bool{model: true}
 	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
+	// Prompt-cache affinity: hash the cacheable prefix once; a live pin
+	// reorders candidates so the pinned provider serves it again.
+	prefixHash := router.CachePrefixHash(body)
+	affinityOn := cur != nil && (cur.PromptCacheAffinity || s.router.AffinityDefault)
+	pinned := false
+	if affinityOn && prefixHash != 0 {
+		pinned = s.router.PinByAffinity(candidates, prefixHash)
+	}
 	for hops := 0; ; hops++ {
 		var at int
 		var lfr *http.Response
@@ -597,8 +605,16 @@ func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model 
 		if le != nil {
 			lastErr = le
 		}
-		if resp != nil || cur == nil || hops >= 3 {
-			return cand, resp, lastFailResp, lastErr, attempts, fused
+		if resp != nil {
+			// Pin the serving provider+model for this prefix (any 2xx/4xx
+			// deterministic response proves the deployment serves it).
+			if affinityOn && prefixHash != 0 && resp.StatusCode < 500 {
+				s.router.RecordAffinity(prefixHash, cand.Provider.Name(), cand.Model)
+			}
+			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
+		}
+		if cur == nil || hops >= 3 {
+			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
 		}
 		// All candidates failed retryably: try the next fallback route.
 		var next *router.Route
@@ -613,7 +629,7 @@ func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model 
 			}
 		}
 		if next == nil {
-			return cand, resp, lastFailResp, lastErr, attempts, fused
+			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
 		}
 		if sel != nil {
 			next = next.WithTags(sel)
@@ -625,6 +641,10 @@ func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model 
 		}
 		cur = next
 		strategy = next.Strategy
+		affinityOn = next.PromptCacheAffinity || s.router.AffinityDefault
+		if affinityOn && prefixHash != 0 {
+			pinned = s.router.PinByAffinity(candidates, prefixHash)
+		}
 	}
 }
 
@@ -723,8 +743,12 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var attempts int
 	fused := false
 	est := estimateChatTokens(body)
-	cand, resp, lastFailResp, lastErr, attempts, fused = s.runRoute(r.Context(), hdr, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
+	var affinityHit bool
+	cand, resp, lastFailResp, lastErr, attempts, fused, affinityHit = s.runRoute(r.Context(), hdr, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
 	setDecisionHeader(w, cand, strategy, attempts)
+	if affinityHit {
+		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";affinity=hit")
+	}
 	if fused {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")
 	}

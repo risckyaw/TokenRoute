@@ -112,7 +112,8 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	}
 	routes := make([]*router.Route, 0, len(cfg.Routes))
 	for _, rc := range cfg.Routes {
-		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier, FallbackRoutes: rc.FallbackRoutes}
+		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier, FallbackRoutes: rc.FallbackRoutes,
+			PromptCacheAffinity: rc.PromptCacheAffinity}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
 				Provider: byName[cc.Provider],
@@ -136,6 +137,19 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
+	// Prompt-cache affinity: one shared pin cache when any route opts in or
+	// the global default enables it (per-route flag gates use at request time).
+	rt.AffinityDefault = cfg.PromptCacheAffinity
+	if cfg.PromptCacheAffinity {
+		rt.SetAffinity(router.NewAffinityCache(time.Hour))
+	} else {
+		for _, rc := range cfg.Routes {
+			if rc.PromptCacheAffinity {
+				rt.SetAffinity(router.NewAffinityCache(time.Hour))
+				break
+			}
+		}
+	}
 	if len(cfg.Aliases) > 0 {
 		rt.SetAliases(cfg.Aliases)
 	}

@@ -114,3 +114,84 @@ func TestFallbackRoute_HopLimit(t *testing.T) {
 		t.Fatalf("status %d, want 200 via a->b->c within hop limit: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAffinity_PinAfterSuccessAndHit(t *testing.T) {
+	good1 := upstream(t, 200, `{"id":"p1","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	good2 := upstream(t, 200, `{"id":"p2","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	p1 := openai.New(openai.Config{Name: "p1", BaseURL: good1.URL, Priority: 1, TimeoutMs: 5000})
+	p2 := openai.New(openai.Config{Name: "p2", BaseURL: good2.URL, Priority: 2, TimeoutMs: 5000})
+	rt := router.New([]provider.Provider{p1, p2}, []*router.Route{{
+		Model: "auto", PromptCacheAffinity: true,
+		Candidates: []router.Candidate{{Provider: p1, Model: "m1"}, {Provider: p2, Model: "m2"}},
+	}})
+	rt.SetAffinity(router.NewAffinityCache(0))
+	ul, err := usage.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ul.Close() })
+	h := New(rt, ul, nil)
+
+	body := `{"model":"auto","messages":[{"role":"system","content":"` +
+		strings.Repeat("s", 1100) + `"},{"role":"user","content":"u"}]}`
+	do := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		return rec
+	}
+	rec := do() // first request: p1 serves, pin recorded
+	if rec.Code != 200 || strings.Contains(rec.Header().Get("X-TokenRoute-Decision"), "affinity=hit") {
+		t.Fatalf("first: %d %s", rec.Code, rec.Header().Get("X-TokenRoute-Decision"))
+	}
+	rec = do() // second: same prefix -> pinned to p1, affinity=hit
+	if !strings.Contains(rec.Header().Get("X-TokenRoute-Decision"), "affinity=hit") {
+		t.Fatalf("second: decision %q, want affinity=hit", rec.Header().Get("X-TokenRoute-Decision"))
+	}
+	if !strings.Contains(rec.Header().Get("X-TokenRoute-Decision"), "provider=p1") {
+		t.Fatalf("second: decision %q, want provider=p1", rec.Header().Get("X-TokenRoute-Decision"))
+	}
+}
+
+func TestAffinity_BypassOnCircuitOpen(t *testing.T) {
+	good1 := upstream(t, 200, `{"id":"p1","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	good2 := upstream(t, 200, `{"id":"p2","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	p1 := openai.New(openai.Config{Name: "p1", BaseURL: good1.URL, Priority: 1, TimeoutMs: 5000})
+	p2 := openai.New(openai.Config{Name: "p2", BaseURL: good2.URL, Priority: 2, TimeoutMs: 5000})
+	rt := router.New([]provider.Provider{p1, p2}, []*router.Route{{
+		Model: "auto", PromptCacheAffinity: true,
+		Candidates: []router.Candidate{{Provider: p1, Model: "m1"}, {Provider: p2, Model: "m2"}},
+	}})
+	rt.SetAffinity(router.NewAffinityCache(0))
+	// Pin p2 (lower priority), then disable p2: pin must be skipped.
+	rt.Affinity().Put(router.CachePrefixHash([]byte(affinityBody)), "p2", "m2")
+	rt.SetCircuit("p2", router.CircuitConfig{FailureThreshold: 1, CooldownMs: 60000})
+	rt.RecordResult("p2", 0, false)
+	ul, err := usage.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ul.Close() })
+	h := New(rt, ul, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(affinityBody)))
+	if d := rec.Header().Get("X-TokenRoute-Decision"); !strings.Contains(d, "provider=p1") || strings.Contains(d, "affinity=hit") {
+		t.Fatalf("decision %q, want provider=p1 without affinity hit (pin filtered)", d)
+	}
+}
+
+const affinityBody = `{"model":"auto","messages":[{"role":"system","content":"` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` +
+	`"},{"role":"user","content":"u"}]}`

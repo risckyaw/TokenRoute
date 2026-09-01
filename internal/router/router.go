@@ -57,6 +57,9 @@ type Route struct {
 	// FallbackRoutes: other virtual models tried when every candidate here
 	// fails retryably (LiteLLM fallbacks); resolved by name at request time.
 	FallbackRoutes []string
+	// PromptCacheAffinity pins requests with a cacheable prefix to the
+	// provider+model that served that prefix (overrides global default).
+	PromptCacheAffinity bool
 
 	rr       atomic.Uint64 // round-robin counter
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)
@@ -94,6 +97,9 @@ type window struct {
 type Router struct {
 	providers []provider.Provider // sorted by priority ascending
 	routes    []*Route
+	// AffinityDefault is the global prompt_cache_affinity default; a route's
+	// own flag wins (Route.PromptCacheAffinity || AffinityDefault).
+	AffinityDefault bool
 	byName    map[string]provider.Provider
 	circuits  map[string]*CircuitBreaker
 	latency   map[string]float64 // EMA latency ms per provider name
@@ -107,6 +113,50 @@ type Router struct {
 	windows   map[string]*window   // provider name -> 60s tumbling counters
 	quota     *QuotaLedger         // pre-request budget awareness (nil-safe)
 	aliases   map[string]string    // client model name -> virtual route model
+	affinity  *AffinityCache       // prompt-prefix pinning (nil = disabled)
+}
+
+// SetAffinity enables prompt-cache affinity pinning (nil disables).
+func (r *Router) SetAffinity(a *AffinityCache) {
+	r.affinity = a
+}
+
+// Affinity returns the pin cache (nil when disabled) — for tests/server.
+func (r *Router) Affinity() *AffinityCache {
+	return r.affinity
+}
+
+// PinByAffinity reorders allowed candidates so the pinned provider+model
+// goes first when the prefix hash has a live pin. Returns true on a hit.
+// The pin must still pass circuit/lock filters (it reorders the already-
+// filtered list, so a filtered-out pin just falls through to normal order).
+func (r *Router) PinByAffinity(allowed []Candidate, hash uint64) bool {
+	if r.affinity == nil || hash == 0 || len(allowed) < 2 {
+		return false
+	}
+	pin, ok := r.affinity.Get(hash)
+	if !ok {
+		return false
+	}
+	for i, c := range allowed {
+		if c.Provider.Name() == pin.Provider && c.Model == pin.Model {
+			if i == 0 {
+				return true
+			}
+			rest := append([]Candidate(nil), allowed[:i]...)
+			rest = append(rest, allowed[i+1:]...)
+			copy(allowed, append([]Candidate{allowed[i]}, rest...))
+			return true
+		}
+	}
+	return false
+}
+
+// RecordAffinity stores prefix -> provider+model after a successful response.
+func (r *Router) RecordAffinity(hash uint64, providerName, model string) {
+	if r.affinity != nil {
+		r.affinity.Put(hash, providerName, model)
+	}
 }
 
 func New(providers []provider.Provider, routes []*Route) *Router {
