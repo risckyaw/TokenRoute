@@ -36,6 +36,7 @@ type Entry struct {
 	Status           int       `json:"status"`
 	LatencyMs        int64     `json:"latency_ms"`
 	CostUSD          *float64  `json:"cost_usd"`
+	BudgetExceeded   bool      `json:"budget_exceeded"`
 }
 
 // KeyAggregate is the per-key usage rollup for the admin API.
@@ -93,7 +94,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	}
 	// Phase 4 columns; ALTER fails on existing DBs that have them, so add
 	// only when missing (checked via pragma).
-	for _, col := range []string{"key_id INTEGER", "key_name TEXT"} {
+	for _, col := range []string{"key_id INTEGER", "key_name TEXT", "budget_exceeded INTEGER"} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "usage_logs", name) {
 			if _, err := db.Exec(`ALTER TABLE usage_logs ADD COLUMN ` + col); err != nil {
@@ -140,19 +141,20 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 	}
 	_, err := l.db.ExecContext(ctx, `INSERT INTO usage_logs
 		(request_id, ts, key_id, key_name, virtual_model, provider, model, prompt_tokens,
-		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd, budget_exceeded)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.RequestID, e.TS.UTC().Format(time.RFC3339Nano), e.KeyID, e.KeyName,
 		e.VirtualModel, e.Provider, e.Model,
 		e.PromptTokens, e.CompletionTokens, e.TotalTokens, boolInt(e.Stream),
-		e.Status, e.LatencyMs, cost)
+		e.Status, e.LatencyMs, cost, boolInt(e.BudgetExceeded))
 	return err
 }
 
 // QueryRecent returns the newest entries, up to limit.
 func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
-		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd
+		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
+		COALESCE(budget_exceeded,0)
 		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -162,16 +164,17 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 	for rows.Next() {
 		var e Entry
 		var ts, keyName string
-		var stream int
+		var stream, budget int
 		var cost sql.NullFloat64
 		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
-			&e.Status, &e.LatencyMs, &cost); err != nil {
+			&e.Status, &e.LatencyMs, &cost, &budget); err != nil {
 			return nil, err
 		}
 		e.KeyName = keyName
 		e.TS, _ = time.Parse(time.RFC3339Nano, ts)
 		e.Stream = stream != 0
+		e.BudgetExceeded = budget != 0
 		if cost.Valid {
 			c := cost.Float64
 			e.CostUSD = &c
@@ -179,6 +182,42 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ExportRows streams rows in [from, to] to fn one at a time (no buffering).
+func (l *Logger) ExportRows(from, to time.Time, fn func(Entry) error) error {
+	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
+		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
+		COALESCE(budget_exceeded,0)
+		FROM usage_logs WHERE ts >= ? AND ts <= ? ORDER BY id`,
+		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e Entry
+		var ts, keyName string
+		var stream, budget int
+		var cost sql.NullFloat64
+		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
+			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
+			&e.Status, &e.LatencyMs, &cost, &budget); err != nil {
+			return err
+		}
+		e.KeyName = keyName
+		e.TS, _ = time.Parse(time.RFC3339Nano, ts)
+		e.Stream = stream != 0
+		e.BudgetExceeded = budget != 0
+		if cost.Valid {
+			c := cost.Float64
+			e.CostUSD = &c
+		}
+		if err := fn(e); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 // AggregateByKey rolls up requests/tokens/cost per API key (key_id 0 =

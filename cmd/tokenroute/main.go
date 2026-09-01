@@ -49,6 +49,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 				Name:      pc.Name,
 				BaseURL:   pc.BaseURL,
 				APIKey:    pc.APIKey,
+				APIKeys:   pc.APIKeys,
 				Priority:  pc.Priority,
 				TimeoutMs: pc.TimeoutMs,
 			})
@@ -57,6 +58,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 				Name:      pc.Name,
 				BaseURL:   pc.BaseURL,
 				APIKey:    pc.APIKey,
+				APIKeys:   pc.APIKeys,
 				Priority:  pc.Priority,
 				TimeoutMs: pc.TimeoutMs,
 			})
@@ -65,6 +67,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 				Name:      pc.Name,
 				BaseURL:   pc.BaseURL,
 				APIKey:    pc.APIKey,
+				APIKeys:   pc.APIKeys,
 				Priority:  pc.Priority,
 				TimeoutMs: pc.TimeoutMs,
 			})

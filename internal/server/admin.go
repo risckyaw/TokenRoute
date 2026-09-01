@@ -2,7 +2,9 @@ package server
 
 import (
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
+	"github.com/Jarvisagentic/tokenroute/internal/usage"
 )
 
 // requireAdmin gates /admin on the configured admin key.
@@ -184,6 +187,62 @@ func (s *srv) adminUsageLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// adminUsageExport streams usage logs as CSV. Query: from/to RFC3339
+// (default: last 24h). format=csv is the only supported format.
+func (s *srv) adminUsageExport(w http.ResponseWriter, r *http.Request) {
+	if s.usage == nil {
+		writeErr(w, http.StatusServiceUnavailable, "usage logging disabled", "invalid_request_error")
+		return
+	}
+	if f := r.URL.Query().Get("format"); f != "" && f != "csv" {
+		writeErr(w, http.StatusBadRequest, "unsupported format: "+f, "invalid_request_error")
+		return
+	}
+	q := r.URL.Query()
+	to := time.Now()
+	from := to.Add(-24 * time.Hour)
+	if v := q.Get("from"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "from must be RFC3339", "invalid_request_error")
+			return
+		}
+		from = t
+	}
+	if v := q.Get("to"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "to must be RFC3339", "invalid_request_error")
+			return
+		}
+		to = t
+	}
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="tokenroute-usage.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"id", "ts", "key_name", "virtual_model", "provider", "model",
+		"prompt_tokens", "completion_tokens", "total_tokens", "stream", "status",
+		"latency_ms", "cost_usd", "budget_exceeded"})
+	err := s.usage.ExportRows(from, to, func(e usage.Entry) error {
+		cost := ""
+		if e.CostUSD != nil {
+			cost = strconv.FormatFloat(*e.CostUSD, 'f', -1, 64)
+		}
+		return cw.Write([]string{
+			strconv.FormatInt(e.ID, 10),
+			e.TS.UTC().Format(time.RFC3339Nano),
+			e.KeyName, e.VirtualModel, e.Provider, e.Model,
+			strconv.Itoa(e.PromptTokens), strconv.Itoa(e.CompletionTokens), strconv.Itoa(e.TotalTokens),
+			strconv.FormatBool(e.Stream), strconv.Itoa(e.Status),
+			strconv.FormatInt(e.LatencyMs, 10), cost, strconv.FormatBool(e.BudgetExceeded),
+		})
+	})
+	cw.Flush()
+	if err != nil {
+		slog.Error("usage export", "err", err)
+	}
 }
 
 func (s *srv) adminProviders(w http.ResponseWriter, _ *http.Request) {

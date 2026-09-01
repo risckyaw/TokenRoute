@@ -24,6 +24,7 @@ type Config struct {
 	Name      string
 	BaseURL   string
 	APIKey    string
+	APIKeys   []string // pool; APIKey appended when set
 	Priority  int
 	TimeoutMs int
 }
@@ -31,7 +32,7 @@ type Config struct {
 type Provider struct {
 	name     string
 	baseURL  string
-	apiKey   string
+	pool     *provider.KeyPool
 	priority int
 	client   *http.Client
 }
@@ -45,10 +46,14 @@ func New(cfg Config) *Provider {
 	if base == "" {
 		base = defaultBaseURL
 	}
+	keys := append([]string(nil), cfg.APIKeys...)
+	if cfg.APIKey != "" {
+		keys = append(keys, cfg.APIKey)
+	}
 	return &Provider{
 		name:     cfg.Name,
 		baseURL:  base,
-		apiKey:   cfg.APIKey,
+		pool:     provider.NewKeyPool(keys...),
 		priority: cfg.Priority,
 		client:   &http.Client{Timeout: timeout},
 	}
@@ -59,7 +64,8 @@ func (p *Provider) Priority() int     { return p.priority }
 func (p *Provider) ModelsURL() string { return p.baseURL + "/models" }
 
 func (p *Provider) Models(ctx context.Context) ([]string, error) {
-	u := p.baseURL + "/models?key=" + url.QueryEscape(p.apiKey)
+	key, _ := p.pool.Pick()
+	u := p.baseURL + "/models?key=" + url.QueryEscape(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -370,6 +376,10 @@ func (t *streamTranslator) Read(p []byte) (int, error) {
 // ---- ChatComplete ----
 
 func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*http.Response, error) {
+	key, ok := p.pool.Pick()
+	if !ok {
+		return nil, fmt.Errorf("all API keys in cooldown")
+	}
 	body, err := translateRequest(preq.Body, preq.Model)
 	if err != nil {
 		return nil, err
@@ -379,7 +389,7 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 	if stream {
 		action = ":streamGenerateContent?alt=sse&key="
 	}
-	u := p.baseURL + "/models/" + url.PathEscape(preq.Model) + action + url.QueryEscape(p.apiKey)
+	u := p.baseURL + "/models/" + url.PathEscape(preq.Model) + action + url.QueryEscape(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -388,6 +398,9 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+		p.pool.Cool(key)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return resp, nil // relay upstream errors unmodified (gateway handles failover)

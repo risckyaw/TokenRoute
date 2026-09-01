@@ -18,6 +18,7 @@ type Config struct {
 	Name      string
 	BaseURL   string
 	APIKey    string
+	APIKeys   []string // pool; APIKey appended when set
 	Priority  int
 	TimeoutMs int
 }
@@ -25,7 +26,7 @@ type Config struct {
 type Provider struct {
 	name     string
 	baseURL  string
-	apiKey   string
+	pool     *provider.KeyPool
 	priority int
 	client   *http.Client
 }
@@ -35,10 +36,14 @@ func New(cfg Config) *Provider {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
+	keys := append([]string(nil), cfg.APIKeys...)
+	if cfg.APIKey != "" {
+		keys = append(keys, cfg.APIKey)
+	}
 	return &Provider{
 		name:     cfg.Name,
 		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
-		apiKey:   cfg.APIKey,
+		pool:     provider.NewKeyPool(keys...),
 		priority: cfg.Priority,
 		client:   &http.Client{Timeout: timeout},
 	}
@@ -53,7 +58,8 @@ func (p *Provider) Models(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.setAuth(req)
+	key, _ := p.pool.Pick()
+	p.setAuth(req, key)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -75,6 +81,10 @@ func (p *Provider) Models(ctx context.Context) ([]string, error) {
 }
 
 func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*http.Response, error) {
+	key, ok := p.pool.Pick()
+	if !ok {
+		return nil, fmt.Errorf("all API keys in cooldown")
+	}
 	body := rewriteModel(preq.Body, preq.Model)
 	url := p.baseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -82,7 +92,7 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	p.setAuth(req)
+	p.setAuth(req, key)
 	for k, vs := range preq.Header {
 		for _, v := range vs {
 			req.Header.Add(k, v)
@@ -92,12 +102,15 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+		p.pool.Cool(key)
+	}
 	return resp, nil
 }
 
-func (p *Provider) setAuth(req *http.Request) {
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+func (p *Provider) setAuth(req *http.Request, key string) {
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 }
 

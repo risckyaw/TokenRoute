@@ -26,6 +26,11 @@ providers:
     type: openai                    # openai-compatible API
     base_url: "https://api.deepseek.com/v1"
     api_key: "${DEEPSEEK_API_KEY}"
+    # Optional key pool (round-robin per request; a key that gets an upstream
+    # 401/429 cools down 60s and is skipped). api_key alone = pool of 1.
+    # api_keys:
+    #   - "${DEEPSEEK_API_KEY}"
+    #   - "${DEEPSEEK_API_KEY_2}"
     priority: 5                     # lower = more preferred
     timeout_ms: 120000
 
@@ -54,7 +59,7 @@ providers:
 
 routes:
   # Virtual model names clients use in "model" field.
-  # strategy: priority (default) | round_robin | least_latency | weighted | cost | lkgp
+  # strategy: priority (default) | round_robin | least_latency | weighted | cost | lkgp | headroom
   # Failover: retryable statuses (429/500/502/503/504) and transport errors
   # fall through to the next candidate; other statuses are relayed as-is.
   - model: auto
@@ -111,3 +116,11 @@ routes:
     candidates:                     # no strategy -> priority
       - provider: openai
         model: gpt-4o
+
+  - model: roomy
+    strategy: headroom              # fewest requests in the last 60s first;
+    candidates:                     # ties fall back to priority order
+      - provider: deepseek
+        model: deepseek-chat
+      - provider: openai
+        model: gpt-4o-mini

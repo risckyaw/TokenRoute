@@ -20,13 +20,14 @@ const (
 	StrategyWeighted     = "weighted"
 	StrategyCost         = "cost"
 	StrategyLKGP         = "lkgp" // last-known-good provider first
+	StrategyHeadroom     = "headroom"
 )
 
 // ValidStrategy reports whether s is a known strategy name.
 func ValidStrategy(s string) bool {
 	switch s {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
-		StrategyWeighted, StrategyCost, StrategyLKGP:
+		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom:
 		return true
 	}
 	return false
@@ -51,6 +52,13 @@ type Route struct {
 	randSrc  *rand.Rand
 }
 
+// window is a 60s tumbling counter used by the headroom strategy.
+type window struct {
+	start time.Time
+	reqs  int
+	toks  int
+}
+
 type Router struct {
 	providers []provider.Provider // sorted by priority ascending
 	routes    []*Route
@@ -61,6 +69,7 @@ type Router struct {
 	latMu     sync.Mutex
 	lockMu    sync.Mutex
 	modelLock map[string]time.Time // provider|model -> locked until
+	windows   map[string]*window   // provider name -> 60s tumbling counters
 }
 
 func New(providers []provider.Provider, routes []*Route) *Router {
@@ -77,6 +86,7 @@ func New(providers []provider.Provider, routes []*Route) *Router {
 		circuits:  map[string]*CircuitBreaker{},
 		latency:   map[string]float64{},
 		modelLock: map[string]time.Time{},
+		windows:   map[string]*window{},
 	}
 	for _, rt := range routes {
 		if rt.Strategy == "" {
@@ -202,6 +212,17 @@ func (r *Router) OrderCandidates(rt *Route) []Candidate {
 		sort.SliceStable(allowed, func(i, j int) bool {
 			return r.costKey(allowed[i]) < r.costKey(allowed[j])
 		})
+	case StrategyHeadroom:
+		r.latMu.Lock()
+		counts := make(map[string]int, len(r.windows))
+		for name, w := range r.windows {
+			counts[name] = w.reqs
+		}
+		r.latMu.Unlock()
+		// Stable sort: ties keep priority order.
+		sort.SliceStable(allowed, func(i, j int) bool {
+			return counts[allowed[i].Provider.Name()] < counts[allowed[j].Provider.Name()]
+		})
 	}
 	return allowed
 }
@@ -226,6 +247,16 @@ func (r *Router) RecordResult(providerName string, latency time.Duration, succes
 		cur = emaAlpha*float64(latency.Milliseconds()) + (1-emaAlpha)*cur
 	}
 	r.latency[providerName] = cur
+	w := r.windows[providerName]
+	if w == nil {
+		w = &window{}
+		r.windows[providerName] = w
+	}
+	if now := time.Now(); now.Sub(w.start) >= 60*time.Second {
+		w.start, w.reqs, w.toks = now, 1, 0
+	} else {
+		w.reqs++
+	}
 	r.latMu.Unlock()
 	if cb, ok := r.circuits[providerName]; ok {
 		if success {

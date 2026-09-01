@@ -12,7 +12,13 @@ speak one API.
   raw bodies forwarded, raw upstream responses (incl. errors) relayed, SSE
   streamed unbuffered.
 - **Routing strategies** — priority, round_robin, least_latency, weighted,
-  cost, lkgp (last-known-good provider, per virtual model).
+  cost, lkgp (last-known-good provider), headroom (fewest requests in the
+  last 60s first), per virtual model.
+- **Per-request budgets** — `X-Max-Cost-USD` header rejects requests whose
+  worst-case estimate exceeds the budget (402 `budget_exceeded`); actual
+  overruns flagged in the usage log.
+- **Provider key pools** — multiple API keys per provider, round-robin with
+  60s cooldown on upstream 401/429.
 - **Failover + circuit breakers** — retryable statuses (429/5xx) and
   transport errors fall through to the next candidate; per-provider
   breakers with half-open probes; 429 `Retry-After` opens the breaker for
@@ -69,11 +75,21 @@ curl -N localhost:8400/v1/chat/completions \
 | `weighted`     | Weighted-random first pick (weight default 1); rest stay in priority order | Gradual traffic shifts / canary |
 | `cost`         | Lowest prompt+completion price first; unpriced last  | Cost optimization |
 | `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
+| `headroom`     | Fewest requests in the last 60s first; ties -> priority | Load-aware spreading |
 
 Failover applies to all strategies: 429/500/502/503/504 and transport
 errors try the next candidate (each tried at most once per request). Other
 statuses (400/401/403/404...) are relayed as-is. Circuit breakers skip
 failing providers (open) and allow one probe while half-open.
+
+## Per-request budgets
+
+Send `X-Max-Cost-USD: <float>` on chat requests. The gateway estimates
+worst-case cost as `max_tokens` (default 4096) × (prompt + completion
+price) of the first serving candidate; when the estimate exceeds the
+budget the request is rejected with 402 `budget_exceeded`. Unpriced models
+always pass. When the *actual* cost exceeds the budget, the usage log row
+is flagged `budget_exceeded` (visible in `/admin/usage/export`).
 
 ## Configuration
 
@@ -85,7 +101,7 @@ failing providers (open) and allow one probe while half-open.
 | `usage_db` | SQLite path (usage logs + API keys), default `data/usage.db` |
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
 | `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m}` USD per 1M tokens |
-| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms}` (defaults 3/30000) |
+| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms}` (defaults 3/30000) |
 | `routes[]` | Virtual `model`, optional `strategy`, ordered `candidates` (`provider`, upstream `model`, optional `weight`) |
 
 Provider types:
@@ -112,6 +128,7 @@ Header `X-Admin-Key: <admin_key>` on every call:
 | `POST /admin/keys/{id}/disable` / `/enable` | Toggle key |
 | `DELETE /admin/keys/{id}` | Delete key |
 | `GET /admin/usage` | Per-key aggregates + totals |
+| `GET /admin/usage/export?format=csv&from&to` | Stream usage logs as CSV (RFC3339 range, default last 24h) |
 | `GET /admin/providers` | Circuit state + EMA latency per provider |
 | `POST /admin/providers/{name}/circuit/reset` | Reset circuit breaker |
 

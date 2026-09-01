@@ -19,6 +19,7 @@ type ProviderConfig struct {
 	Type      string         `yaml:"type"`
 	BaseURL   string         `yaml:"base_url"`
 	APIKey    string         `yaml:"api_key"`
+	APIKeys   []string       `yaml:"api_keys"` // pool; api_key still works (pool of 1)
 	Priority  int            `yaml:"priority"`
 	TimeoutMs int            `yaml:"timeout_ms"`
 	Circuit   *CircuitConfig `yaml:"circuit"`
@@ -32,7 +33,7 @@ type CandidateConfig struct {
 
 type RouteConfig struct {
 	Model      string            `yaml:"model"`
-	Strategy   string            `yaml:"strategy"` // priority|round_robin|least_latency|weighted|cost|lkgp
+	Strategy   string            `yaml:"strategy"` // priority|round_robin|least_latency|weighted|cost|lkgp|headroom
 	Candidates []CandidateConfig `yaml:"candidates"`
 }
 
@@ -63,6 +64,9 @@ func Load(path string) (*Config, error) {
 	for i := range cfg.Providers {
 		cfg.Providers[i].BaseURL = expandIfPresent(cfg.Providers[i].BaseURL)
 		cfg.Providers[i].APIKey = expandIfPresent(cfg.Providers[i].APIKey)
+		for j := range cfg.Providers[i].APIKeys {
+			cfg.Providers[i].APIKeys[j] = expandIfPresent(cfg.Providers[i].APIKeys[j])
+		}
 	}
 	cfg.AdminKey = expandIfPresent(cfg.AdminKey)
 	if cfg.Listen == "" {
@@ -122,7 +126,7 @@ func (c *Config) Validate() error {
 // validStrategy mirrors router strategy names; kept local to avoid an import.
 func validStrategy(s string) bool {
 	switch s {
-	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp":
+	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom":
 		return true
 	}
 	return false

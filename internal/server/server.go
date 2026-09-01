@@ -85,6 +85,7 @@ func (s *srv) registerAdmin(mux chi.Router) {
 		r.Delete("/keys/{id}", s.adminDeleteKey)
 		r.Get("/usage", s.adminUsage)
 		r.Get("/usage/logs", s.adminUsageLogs)
+		r.Get("/usage/export", s.adminUsageExport)
 		r.Get("/providers", s.adminProviders)
 		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
 	})
@@ -214,6 +215,24 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-request budget: reject when the pessimistic estimate (max_tokens
+	// for both prompt and completion) at the first candidate's price
+	// exceeds X-Max-Cost-USD. Unknown price -> allow.
+	budget, hasBudget := parseMaxCost(r.Header.Get("X-Max-Cost-USD"))
+	if hasBudget {
+		maxTok := 4096
+		if mt, ok := parsed["max_tokens"].(float64); ok && mt > 0 {
+			maxTok = int(mt)
+		}
+		if p, ok := s.prices[candidates[0].Model]; ok {
+			est := float64(maxTok) / 1e6 * (p.PromptPer1M + p.CompletionPer1M)
+			if est > budget {
+				writeErr(w, http.StatusPaymentRequired, "budget exceeded", "budget_exceeded")
+				return
+			}
+		}
+	}
+
 	// Phase 3: failover across ordered candidates; each tried at most once.
 	var resp *http.Response
 	var cand router.Candidate
@@ -308,6 +327,9 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if p, ok := s.prices[cand.Model]; ok {
 		entry.CostUSD = usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p)
 	}
+	if hasBudget && entry.CostUSD != nil && *entry.CostUSD > budget {
+		entry.BudgetExceeded = true
+	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {
 			s.limiter.DeductTPM(k.ID, k.TPM, entry.TotalTokens)
@@ -317,6 +339,19 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.logEntry(r.Context(), entry)
+}
+
+// parseMaxCost parses the X-Max-Cost-USD header; ok=false when absent or
+// not a positive float (invalid values are ignored, not rejected).
+func parseMaxCost(v string) (float64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || f <= 0 {
+		return 0, false
+	}
+	return f, true
 }
 
 func keyID(k *auth.Key) int64 {
@@ -390,6 +425,9 @@ func (s *srv) logEntry(ctx context.Context, e usage.Entry) {
 	}
 	if e.CostUSD != nil {
 		attrs = append(attrs, "cost_usd", *e.CostUSD)
+	}
+	if e.BudgetExceeded {
+		attrs = append(attrs, "budget_exceeded", true)
 	}
 	slog.Info("request", attrs...)
 }
