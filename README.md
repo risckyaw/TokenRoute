@@ -53,6 +53,9 @@ speak one API.
   with isolated buckets (Kong-style `limit_by`).
 - **Correlation IDs** — every request gets `X-Correlation-ID` (generated
   when absent, propagated upstream, echoed downstream).
+- **Request size limiting** — Content-Length pre-check rejects oversized
+  bodies before any read (413; 417 for `Expect: 100-continue`); chunked
+  bodies still bounded by `MaxBytesReader` at parse time.
 - **Provider adapters** — [OI]-compatible (DeepSeek, OpenRouter, Ollama...),
   Anthropic Messages API, Gemini generateContent — all exposed as [OI].
 - **Admin dashboard** — single-page dark UI at `/admin/` (keys, usage,

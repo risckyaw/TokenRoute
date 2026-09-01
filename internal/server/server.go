@@ -97,6 +97,7 @@ func NewWithOptions(o Options) http.Handler {
 	}
 	mux.Group(func(r chi.Router) {
 		r.Use(s.requireKey)
+		r.Use(requestSizeLimit(s.maxBody))
 		r.Use(timeoutOverride)
 		r.Post("/v1/chat/completions", s.chatCompletions)
 		r.Post("/v1/embeddings", s.embeddings)
