@@ -11,17 +11,24 @@ const dashboardPage = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TokenRoute Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap">
 <style>
   :root {
-    --bg:#0B0B10; --card:#131318; --border:#1E293B; --fg:#F8FAFC;
-    --muted:#94A3B8; --accent:#3B82F6; --red:#EF4444; --green:#34D399; --amber:#FBBF24;
-    --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+    --bg:#020617; --card:#0E1223; --muted-bg:#1A1E2F; --border:#334155;
+    --fg:#F8FAFC; --muted:#94A3B8;
+    --accent:#3B82F6; --accent-hi:#60A5FA;
+    --red:#EF4444; --green:#34D399; --amber:#FBBF24;
+    --sans:"Fira Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:"Fira Code",ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+    --r:6px;
   }
   * { box-sizing:border-box; margin:0; }
   html { font-size:13px; }
   body {
     background:var(--bg); color:var(--fg);
-    font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    font:13px/1.55 var(--sans);
   }
   .mono, td.n, .num { font-family:var(--mono); font-variant-numeric:tabular-nums; }
   a { color:var(--accent); text-decoration:none; }
@@ -35,19 +42,20 @@ const dashboardPage = `<!DOCTYPE html>
   .ic { width:16px; height:16px; flex:none; stroke:currentColor; fill:none; stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round; }
 
   /* Layout */
-  #app { display:grid; grid-template-columns:200px 1fr; min-height:100vh; }
+  #app { display:grid; grid-template-columns:210px 1fr; min-height:100vh; }
   aside {
     border-right:1px solid var(--border); padding:20px 12px;
     position:sticky; top:0; height:100vh; display:flex; flex-direction:column; gap:2px;
+    background:var(--card);
   }
   .wordmark { font-weight:700; font-size:15px; padding:0 10px 18px; letter-spacing:.02em; }
-  .wordmark span { color:var(--accent); }
+  .wordmark span { color:var(--accent-hi); }
   nav a {
-    display:flex; align-items:center; gap:9px; padding:7px 10px; border-radius:6px; color:var(--muted);
+    display:flex; align-items:center; gap:9px; padding:7px 10px; border-radius:var(--r); color:var(--muted);
     transition:background 150ms ease,color 150ms ease;
   }
-  nav a:hover { color:var(--fg); background:#17171e; }
-  nav a.active { color:var(--fg); background:#1a2333; }
+  nav a:hover { color:var(--fg); background:var(--muted-bg); }
+  nav a.active { color:var(--fg); background:var(--muted-bg); box-shadow:inset 2px 0 0 var(--accent); }
   main { padding:0 24px 48px; min-width:0; }
 
   /* Top bar */
@@ -58,16 +66,19 @@ const dashboardPage = `<!DOCTYPE html>
   }
   header input[type=password] {
     background:var(--card); border:1px solid var(--border); color:var(--fg);
-    border-radius:6px; padding:6px 10px; width:300px; font-family:var(--mono);
+    border-radius:var(--r); padding:6px 10px; width:300px; font-family:var(--mono);
   }
+  header input[type=password]::placeholder { color:var(--muted); opacity:.7; }
   #live { margin-left:auto; display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
   #dot { width:8px; height:8px; border-radius:50%; background:var(--green); animation:pulse 2s infinite; }
+  #live.stale #dot { background:var(--red); animation:none; }
+  #live.stale { color:var(--red); }
   @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
   #updated { font-family:var(--mono); font-size:11px; }
 
   #errbar {
-    display:none; background:#2a1215; border:1px solid var(--red); color:#fca5a5;
-    border-radius:6px; padding:10px 14px; margin-bottom:20px;
+    display:none; background:rgba(239,68,68,.1); border:1px solid var(--red); color:#fca5a5;
+    border-radius:var(--r); padding:10px 14px; margin-bottom:20px;
   }
 
   section { display:none; }
@@ -79,9 +90,11 @@ const dashboardPage = `<!DOCTYPE html>
   /* Cards + KPI */
   .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }
   .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:20px; }
+  .kpi { position:relative; }
+  .kpi::before { content:""; position:absolute; top:0; left:0; right:0; height:2px; background:var(--accent); opacity:.55; border-radius:8px 8px 0 0; }
   .kpi .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; display:flex; align-items:center; gap:6px; }
   .kpi .value { font-family:var(--mono); font-size:24px; font-weight:600; margin-top:6px; }
-  .kpi .value.accent { color:var(--accent); }
+  .kpi .value.accent { color:var(--accent-hi); }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   @media (max-width:1000px) { .grid2 { grid-template-columns:1fr; } }
   .card h3 { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; margin-bottom:12px; display:flex; align-items:center; gap:6px; }
@@ -90,40 +103,41 @@ const dashboardPage = `<!DOCTYPE html>
   .tblwrap { overflow-x:auto; }
   table { width:100%; border-collapse:collapse; }
   th, td { padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
+  td.n { text-align:right; }
   th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
   tbody tr { transition:background 150ms ease; }
-  tbody tr:hover { background:#17171e; }
+  tbody tr:hover { background:var(--muted-bg); }
   tbody tr:last-child td { border-bottom:none; }
   td.wrap { white-space:normal; }
 
   /* Pills */
   .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:11px; font-weight:600; font-family:var(--mono); }
-  .pill.closed, .pill.s2 { background:rgba(52,211,153,.12); color:var(--green); }
-  .pill.open, .pill.s5 { background:rgba(239,68,68,.12); color:var(--red); }
-  .pill.half-open, .pill.s4 { background:rgba(251,191,36,.12); color:var(--amber); }
+  .pill.closed, .pill.s2 { background:rgba(52,211,153,.14); color:var(--green); border:1px solid rgba(52,211,153,.3); }
+  .pill.open, .pill.s5 { background:rgba(239,68,68,.14); color:var(--red); border:1px solid rgba(239,68,68,.3); }
+  .pill.half-open, .pill.s4 { background:rgba(251,191,36,.14); color:var(--amber); border:1px solid rgba(251,191,36,.3); }
   .tag {
     display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:600;
-    font-family:var(--mono); background:rgba(59,130,246,.14); color:var(--accent);
-    border:1px solid rgba(59,130,246,.35); margin-left:6px; vertical-align:1px;
+    font-family:var(--mono); background:rgba(59,130,246,.16); color:var(--accent-hi);
+    border:1px solid rgba(59,130,246,.4); margin-left:6px; vertical-align:1px;
   }
 
   /* Buttons */
   .btn {
-    background:#1a2333; color:var(--fg); border:1px solid var(--border);
-    border-radius:6px; padding:5px 12px; transition:background 150ms ease,transform 50ms ease;
+    background:var(--muted-bg); color:var(--fg); border:1px solid var(--border);
+    border-radius:var(--r); padding:5px 12px; transition:background 150ms ease,transform 50ms ease,border-color 150ms ease;
   }
-  .btn:hover { background:#22304a; }
+  .btn:hover { background:#232B45; border-color:#475569; }
   .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .btn.primary:hover:not(:disabled) { background:#2f6fd6; }
-  .btn.danger { background:transparent; border-color:var(--red); color:var(--red); }
-  .btn.danger:hover { background:rgba(239,68,68,.12); }
+  .btn.primary:hover:not(:disabled) { background:#2563EB; }
+  .btn.danger { background:transparent; border-color:rgba(239,68,68,.5); color:var(--red); }
+  .btn.danger:hover { background:rgba(239,68,68,.12); border-color:var(--red); }
   .btn.sm { padding:3px 9px; font-size:12px; }
 
   /* Toggle switch */
   .sw { position:relative; width:34px; height:18px; display:inline-block; vertical-align:middle; }
   .sw input { opacity:0; width:0; height:0; }
   .sw .track {
-    position:absolute; inset:0; background:#2a3348; border-radius:999px; transition:background 200ms ease;
+    position:absolute; inset:0; background:#334155; border-radius:999px; transition:background 200ms ease;
   }
   .sw .track::after {
     content:""; position:absolute; top:2px; left:2px; width:14px; height:14px;
@@ -137,18 +151,19 @@ const dashboardPage = `<!DOCTYPE html>
   .formrow { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:16px; }
   .field label { display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; margin-bottom:4px; }
   .field input {
-    background:var(--card); border:1px solid var(--border); color:var(--fg);
-    border-radius:6px; padding:6px 10px; width:140px; font-family:var(--mono);
+    background:var(--bg); border:1px solid var(--border); color:var(--fg);
+    border-radius:var(--r); padding:6px 10px; width:140px; font-family:var(--mono);
   }
+  .field input::placeholder { color:var(--muted); opacity:.7; }
   .field input.wide { width:220px; font-family:inherit; }
   #create-err { color:var(--red); font-size:12px; margin:-8px 0 12px; display:none; }
 
   /* New key reveal */
   #newkey {
-    display:none; background:#0f1a2e; border:1px solid var(--accent); border-radius:8px;
+    display:none; background:rgba(59,130,246,.1); border:1px solid var(--accent); border-radius:8px;
     padding:14px 16px; margin-bottom:16px;
   }
-  #newkey .k { font-family:var(--mono); font-size:14px; color:var(--accent); word-break:break-all; margin:6px 0 10px; }
+  #newkey .k { font-family:var(--mono); font-size:14px; color:var(--accent-hi); word-break:break-all; margin:6px 0 10px; }
 
   /* Bar chart */
   .bar-row { display:grid; grid-template-columns:140px 1fr 90px; align-items:center; gap:10px; margin-bottom:8px; }
@@ -167,7 +182,7 @@ const dashboardPage = `<!DOCTYPE html>
   .skel td { padding:8px 10px; border-bottom:1px solid var(--border); }
   .skel .b {
     height:12px; border-radius:4px; width:70%;
-    background:linear-gradient(90deg,#17171e 25%,#1f2430 50%,#17171e 75%);
+    background:linear-gradient(90deg,var(--muted-bg) 25%,#232B45 50%,var(--muted-bg) 75%);
     background-size:200% 100%; animation:shimmer 1.4s infinite linear;
   }
   .empty { color:var(--muted); padding:24px 10px; text-align:center; }
@@ -192,17 +207,17 @@ const dashboardPage = `<!DOCTYPE html>
     <header>
       <input id="key" type="password" placeholder="admin key" aria-label="admin key">
       <button class="btn" id="savekey">Save key</button>
-      <div id="live"><span id="dot" aria-hidden="true"></span>live <span id="updated"></span></div>
+      <div id="live"><span id="dot" aria-hidden="true"></span><span id="livelabel">live</span> <span id="updated"></span></div>
     </header>
     <div id="errbar" role="alert"></div>
 
     <section id="s-overview" class="active">
       <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20a8 8 0 1 1 8-8"/><path d="M12 12l5-5"/><circle cx="12" cy="12" r="1.5"/></svg>Overview</h2>
       <div class="kpis">
-        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>Total requests</div><div class="value" id="k-req" data-v="-">-</div></div>
-        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16"/><path d="M9 4v16"/><path d="M15 4v16"/><path d="M19 4v16"/><path d="M3 8h18"/><path d="M3 16h18"/></svg>Total tokens</div><div class="value" id="k-tok" data-v="-">-</div></div>
-        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v10"/><path d="M15 9.5c-.6-1-1.7-1.5-3-1.5-1.7 0-3 .8-3 2.25s1.3 1.9 3 2.25c1.7.35 3 .8 3 2.25S13.7 17 12 17c-1.3 0-2.4-.5-3-1.5"/></svg>Total cost USD</div><div class="value accent" id="k-cost" data-v="-">-</div></div>
-        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="7"/><path d="M12 10v3l2 2"/><path d="M9 3h6"/></svg>Avg latency ms</div><div class="value" id="k-lat" data-v="-">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>Total requests</div><div class="value" id="k-req" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16"/><path d="M9 4v16"/><path d="M15 4v16"/><path d="M19 4v16"/><path d="M3 8h18"/><path d="M3 16h18"/></svg>Total tokens</div><div class="value" id="k-tok" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v10"/><path d="M15 9.5c-.6-1-1.7-1.5-3-1.5-1.7 0-3 .8-3 2.25s1.3 1.9 3 2.25c1.7.35 3 .8 3 2.25S13.7 17 12 17c-1.3 0-2.4-.5-3-1.5"/></svg>Total cost USD</div><div class="value accent" id="k-cost" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="7"/><path d="M12 10v3l2 2"/><path d="M9 3h6"/></svg>Avg latency ms</div><div class="value" id="k-lat" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
       </div>
       <div class="card" id="reqchart">
         <h3><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-6 4 3 6-8"/><path d="M3 21h18"/></svg>Requests per minute &middot; last 30 min</h3>
@@ -238,7 +253,7 @@ const dashboardPage = `<!DOCTYPE html>
       <div class="card" style="padding:4px 8px">
         <div class="tblwrap">
         <table id="keys">
-          <thead><tr><th>Name</th><th>Key</th><th>RPM</th><th>TPM</th><th>Quota</th><th>Spent</th><th>Enabled</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Key</th><th>RPM</th><th>TPM</th><th>Quota</th><th>Spent</th><th>Enabled</th><th style="text-align:right">Actions</th></tr></thead>
           <tbody></tbody>
         </table>
         </div>
@@ -250,7 +265,7 @@ const dashboardPage = `<!DOCTYPE html>
       <div class="card" style="padding:4px 8px">
         <div class="tblwrap">
         <table id="providers">
-          <thead><tr><th>Name</th><th>Priority</th><th>EMA latency ms</th><th>Circuit</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Priority</th><th>EMA latency ms</th><th>Circuit</th><th style="text-align:right">Actions</th></tr></thead>
           <tbody></tbody>
         </table>
         </div>
@@ -347,6 +362,7 @@ function emptyRow(cols, msg) { return '<tr><td colspan="' + cols + '" class="emp
 
 let loaded = {};
 async function refresh(force) {
+  const live = $("live");
   try {
     if (current === "overview") await loadOverview();
     else if (current === "keys") await loadKeys(force);
@@ -354,8 +370,12 @@ async function refresh(force) {
     else if (current === "logs") await loadLogs();
     clearErr();
     loaded[current] = true;
+    live.classList.remove("stale");
+    $("livelabel").textContent = "live";
     $("updated").textContent = new Date().toLocaleTimeString("en-GB", {hour12:false});
   } catch (e) {
+    live.classList.add("stale");
+    $("livelabel").textContent = "stale";
     if (e.auth) showErr("Unauthorized. Enter a valid admin key above and press Save key.");
     else showErr(e.message);
   }
@@ -389,8 +409,8 @@ async function loadReqChart() {
   const base = (H - pad).toFixed(1);
   body.innerHTML =
     '<svg class="plot" viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" aria-hidden="true">' +
-    '<line x1="0" y1="' + base + '" x2="' + W + '" y2="' + base + '" stroke="#1E293B" stroke-width="1"/>' +
-    '<line x1="0" y1="' + (H * 0.5).toFixed(1) + '" x2="' + W + '" y2="' + (H * 0.5).toFixed(1) + '" stroke="#1E293B" stroke-width="1" stroke-dasharray="3 5" opacity=".6"/>' +
+    '<line x1="0" y1="' + base + '" x2="' + W + '" y2="' + base + '" stroke="#334155" stroke-width="1"/>' +
+    '<line x1="0" y1="' + (H * 0.5).toFixed(1) + '" x2="' + W + '" y2="' + (H * 0.5).toFixed(1) + '" stroke="#334155" stroke-width="1" stroke-dasharray="3 5" opacity=".6"/>' +
     '<path d="' + area + '" fill="#3B82F6" opacity=".2"/>' +
     '<path d="' + line + '" fill="none" stroke="#3B82F6" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>' +
     "</svg>" +
@@ -441,7 +461,7 @@ async function loadKeys(force) {
     "<td class='n'>" + unl(k.quota_tokens) + "</td><td class='n'>" + fmt(k.spent_tokens) + "</td>" +
     "<td><label class='sw'><input type='checkbox' " + (k.enabled ? "checked " : "") +
     "onchange='toggle(" + k.id + ",this.checked)' aria-label='toggle key " + esc(k.name) + "'><span class='track'></span></label></td>" +
-    "<td><button class='btn danger sm' onclick='delKey(" + k.id + ",\"" + esc(k.name).replace(/"/g, "&quot;") + "\")'>Delete</button></td></tr>"
+    "<td style='text-align:right'><button class='btn danger sm' onclick='delKey(" + k.id + ",\"" + esc(k.name).replace(/"/g, "&quot;") + "\")'>Delete</button></td></tr>"
   ).join("") : emptyRow(8, "No API keys yet. Create your first one above.");
 }
 
@@ -502,7 +522,7 @@ async function loadProviders() {
     "<tr><td class='mono'>" + esc(p.name) + "</td><td class='n'>" + p.priority + "</td>" +
     "<td class='n'>" + Math.round(p.ema_latency_ms || 0) + "</td>" +
     "<td><span class='pill " + esc(p.circuit) + "'>" + esc(p.circuit) + "</span></td>" +
-    "<td><button class='btn sm' onclick='testProvider(\"" + esc(p.name).replace(/"/g, "&quot;") + "\", this)'>Test</button> " +
+    "<td style='text-align:right'><button class='btn sm' onclick='testProvider(\"" + esc(p.name).replace(/"/g, "&quot;") + "\", this)'>Test</button> " +
     "<button class='btn sm' onclick='resetCircuit(\"" + esc(p.name).replace(/"/g, "&quot;") + "\")'>Reset circuit</button></td></tr>"
   ).join("") : emptyRow(5, "No providers configured.");
 }
