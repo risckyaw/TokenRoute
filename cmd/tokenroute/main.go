@@ -160,16 +160,35 @@ func main() {
 		server.NewWithOptions(server.Options{
 			Router: st.router, Usage: st.usage, Prices: st.prices,
 			Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
+			SeparateAdmin: cfg.AdminListen != "",
 		}).ServeHTTP(w, r)
 	})
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler}
 	listenAddr := cfg.Listen
+
+	// Optional dedicated admin listener (public mux has no /admin routes).
+	var adminSrv *http.Server
+	adminAddr := cfg.AdminListen
+	if adminAddr != "" {
+		adminHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			st := current.Load()
+			server.NewAdminOnly(server.Options{
+				Router: st.router, Usage: st.usage, Prices: st.prices,
+				Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
+			}).ServeHTTP(w, r)
+		})
+		adminSrv = &http.Server{Addr: adminAddr, Handler: adminHandler}
+	}
 
 	errCh := make(chan error, 2)
 	serve := func(s *http.Server) {
 		errCh <- s.ListenAndServe()
 	}
 	go serve(srv)
+	if adminSrv != nil {
+		go serve(adminSrv)
+		log.Info("admin listener", "addr", adminAddr)
+	}
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -218,6 +237,11 @@ func main() {
 			log.Info("shutting down", "signal", sig.String())
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
+			if adminSrv != nil {
+				if err := adminSrv.Shutdown(ctx); err != nil {
+					log.Error("admin shutdown", "err", err)
+				}
+			}
 			if err := srv.Shutdown(ctx); err != nil {
 				log.Error("shutdown", "err", err)
 				os.Exit(1)

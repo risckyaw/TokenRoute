@@ -37,6 +37,9 @@ type Options struct {
 	Keys     *auth.Store // nil disables virtual-key auth
 	Limiter  *ratelimit.Registry
 	AdminKey string // empty = /admin disabled (503)
+	// SeparateAdmin, when true, removes /admin routes from this handler —
+	// they are served by NewAdminOnly on a dedicated listener.
+	SeparateAdmin bool
 }
 
 // New builds the handler. Kept for compatibility: auth disabled.
@@ -55,6 +58,23 @@ func NewWithOptions(o Options) http.Handler {
 		r.Get("/v1/models", s.models)
 		r.Get("/v1/usage/recent", s.usageRecent)
 	})
+	if !o.SeparateAdmin {
+		s.registerAdmin(mux)
+	}
+	return mux
+}
+
+// NewAdminOnly serves only /admin routes (dedicated admin listener).
+func NewAdminOnly(o Options) http.Handler {
+	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey}
+	mux := chi.NewRouter()
+	mux.Get("/healthz", s.healthz)
+	s.registerAdmin(mux)
+	return mux
+}
+
+func (s *srv) registerAdmin(mux chi.Router) {
 	mux.Route("/admin", func(r chi.Router) {
 		r.Use(s.requireAdmin)
 		r.Get("/", s.adminDashboard)
@@ -67,7 +87,6 @@ func NewWithOptions(o Options) http.Handler {
 		r.Get("/providers", s.adminProviders)
 		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
 	})
-	return mux
 }
 
 type srv struct {

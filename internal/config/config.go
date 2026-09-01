@@ -42,12 +42,13 @@ type PriceConfig struct {
 }
 
 type Config struct {
-	Listen    string                 `yaml:"listen"`
-	UsageDB   string                 `yaml:"usage_db"`
-	AdminKey  string                 `yaml:"admin_key"`
-	Providers []ProviderConfig       `yaml:"providers"`
-	Routes    []RouteConfig          `yaml:"routes"`
-	Prices    map[string]PriceConfig `yaml:"prices"`
+	Listen      string                 `yaml:"listen"`
+	AdminListen string                 `yaml:"admin_listen"` // optional dedicated admin listener
+	UsageDB     string                 `yaml:"usage_db"`
+	AdminKey    string                 `yaml:"admin_key"`
+	Providers   []ProviderConfig       `yaml:"providers"`
+	Routes      []RouteConfig          `yaml:"routes"`
+	Prices      map[string]PriceConfig `yaml:"prices"`
 }
 
 func Load(path string) (*Config, error) {
