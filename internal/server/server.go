@@ -37,6 +37,8 @@ type Options struct {
 	Keys     *auth.Store // nil disables virtual-key auth
 	Limiter  *ratelimit.Registry
 	AdminKey string // empty = /admin disabled (503)
+	// Cache enables the in-memory response cache when non-nil.
+	Cache *RespCache
 	// SeparateAdmin, when true, removes /admin routes from this handler —
 	// they are served by NewAdminOnly on a dedicated listener.
 	SeparateAdmin bool
@@ -49,12 +51,13 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
-		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey}
+		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	mux.Group(func(r chi.Router) {
 		r.Use(s.requireKey)
 		r.Post("/v1/chat/completions", s.chatCompletions)
+		r.Post("/v1/embeddings", s.embeddings)
 		r.Get("/v1/models", s.models)
 		r.Get("/v1/usage/recent", s.usageRecent)
 	})
@@ -98,6 +101,7 @@ type srv struct {
 	keys     *auth.Store
 	limiter  *ratelimit.Registry
 	adminKey string
+	cache    *RespCache
 }
 
 // requireKey validates "Authorization: Bearer gw-..." when auth is enabled.
@@ -157,50 +161,56 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	reqID := newRequestID()
-	w.Header().Set("X-Request-Id", reqID)
+// callFn is one upstream call shape (chat or embeddings).
+type callFn func(context.Context, provider.Provider, *provider.Request) (*http.Response, error)
 
+func chatCall(ctx context.Context, p provider.Provider, req *provider.Request) (*http.Response, error) {
+	return p.ChatComplete(ctx, req)
+}
+
+func embedCall(ctx context.Context, p provider.Provider, req *provider.Request) (*http.Response, error) {
+	return p.Embed(ctx, req)
+}
+
+// prepareRequest validates the body/model, applies per-key auth/ratelimit/
+// quota, and resolves ordered candidates. ok=false = error already written.
+func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byte, model string, k *auth.Key, candidates []router.Candidate, strategy string, ok bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
-		return
+		return nil, "", nil, nil, "", false
 	}
 	var parsed map[string]any
 	_ = json.Unmarshal(body, &parsed)
-	model, _ := parsed["model"].(string)
+	model, _ = parsed["model"].(string)
 	if model == "" {
 		writeErr(w, http.StatusBadRequest, "missing or empty \"model\" field", "invalid_request_error")
-		return
+		return nil, "", nil, nil, "", false
 	}
-	stream, _ := parsed["stream"].(bool)
 
 	// Phase 4: per-key authorization, rate limits, quota.
-	k, _ := r.Context().Value(ctxAPIKey).(*auth.Key)
+	k, _ = r.Context().Value(ctxAPIKey).(*auth.Key)
 	if k != nil {
 		if !modelAllowed(k, model) {
 			writeErr(w, http.StatusForbidden, "model not allowed for this API key", "model_not_allowed")
-			return
+			return nil, "", nil, nil, "", false
 		}
 		if k.QuotaTokens > 0 && k.SpentTokens >= k.QuotaTokens {
 			writeErr(w, http.StatusForbidden, "token quota exceeded", "quota_exceeded")
-			return
+			return nil, "", nil, nil, "", false
 		}
 		if s.limiter != nil {
 			if !s.limiter.AllowRPM(k.ID, k.RPM) {
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return
+				return nil, "", nil, nil, "", false
 			}
 			if s.limiter.TPMRemaining(k.ID, k.TPM) <= 0 {
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return
+				return nil, "", nil, nil, "", false
 			}
 		}
 	}
 
-	var candidates []router.Candidate
-	strategy := ""
 	if rt := s.router.Resolve(model); rt != nil {
 		candidates = s.router.OrderCandidates(rt)
 		strategy = rt.Strategy
@@ -212,42 +222,21 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(candidates) == 0 {
 		writeErr(w, http.StatusBadRequest, "no provider available for model: "+model, "invalid_request_error")
-		return
+		return nil, "", nil, nil, "", false
 	}
+	return body, model, k, candidates, strategy, true
+}
 
-	// Per-request budget: reject when the pessimistic estimate (max_tokens
-	// for both prompt and completion) at the first candidate's price
-	// exceeds X-Max-Cost-USD. Unknown price -> allow.
-	budget, hasBudget := parseMaxCost(r.Header.Get("X-Max-Cost-USD"))
-	if hasBudget {
-		maxTok := 4096
-		if mt, ok := parsed["max_tokens"].(float64); ok && mt > 0 {
-			maxTok = int(mt)
-		}
-		if p, ok := s.prices[candidates[0].Model]; ok {
-			est := float64(maxTok) / 1e6 * (p.PromptPer1M + p.CompletionPer1M)
-			if est > budget {
-				writeErr(w, http.StatusPaymentRequired, "budget exceeded", "budget_exceeded")
-				return
-			}
-		}
-	}
-
-	// Phase 3: failover across ordered candidates; each tried at most once.
-	var resp *http.Response
-	var cand router.Candidate
-	var lastErr error
-	var lastFailResp *http.Response // buffered retryable upstream error
-	var attempts int
+// failover tries candidates in order with the given call; each tried at most
+// once. Returns the chosen candidate, its deterministic response (nil when
+// all failed), the last retryable upstream response (buffered), and the last
+// transport error.
+func (s *srv) failover(ctx context.Context, hdr http.Header, body []byte, candidates []router.Candidate, call callFn) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
 	for _, c := range candidates {
 		cand = c
 		attemptStart := time.Now()
-		req := &provider.Request{
-			Model:  c.Model,
-			Body:   body,
-			Header: filterHeaders(r.Header),
-		}
-		att, err := c.Provider.ChatComplete(r.Context(), req)
+		req := &provider.Request{Model: c.Model, Body: body, Header: hdr}
+		att, err := call(ctx, c.Provider, req)
 		attempts++
 		if err != nil {
 			s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
@@ -289,7 +278,102 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp = att
 		break
 	}
+	return cand, resp, lastFailResp, lastErr, attempts
+}
+
+// relayAllFailed writes the terminal response when every candidate failed:
+// the last retryable upstream response as-is, else a 502 transport error.
+func (s *srv) relayAllFailed(w http.ResponseWriter, entry *usage.Entry, lastFailResp *http.Response, lastErr error) {
+	if lastFailResp != nil {
+		// All candidates failed with retryable upstream statuses:
+		// relay the last one as-is (Phase 1 transparency).
+		entry.Status = lastFailResp.StatusCode
+		s.relayFull(w, lastFailResp, entry)
+	} else {
+		writeErr(w, http.StatusBadGateway, "upstream error: "+lastErr.Error(), "upstream_error")
+	}
+}
+
+func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	reqID := newRequestID()
+	w.Header().Set("X-Request-Id", reqID)
+
+	body, model, k, candidates, strategy, ok := s.prepareRequest(w, r)
+	if !ok {
+		return
+	}
+	var parsed map[string]any
+	_ = json.Unmarshal(body, &parsed)
+	stream, _ := parsed["stream"].(bool)
+
+	// Per-request budget: reject when the pessimistic estimate (max_tokens
+	// for both prompt and completion) at the first candidate's price
+	// exceeds X-Max-Cost-USD. Unknown price -> allow.
+	budget, hasBudget := parseMaxCost(r.Header.Get("X-Max-Cost-USD"))
+	if hasBudget {
+		maxTok := 4096
+		if mt, ok := parsed["max_tokens"].(float64); ok && mt > 0 {
+			maxTok = int(mt)
+		}
+		if p, ok := s.prices[candidates[0].Model]; ok {
+			est := float64(maxTok) / 1e6 * (p.PromptPer1M + p.CompletionPer1M)
+			if est > budget {
+				writeErr(w, http.StatusPaymentRequired, "budget exceeded", "budget_exceeded")
+				return
+			}
+		}
+	}
+
+	hdr := filterHeaders(r.Header)
+
+	// Response cache: non-stream only; key uses the first candidate's
+	// upstream model so a routing change misses instead of cross-serving.
+	ck := ""
+	if !stream && s.cache != nil {
+		ck = cacheKey(model, candidates[0].Model, body)
+		if hit := s.cache.get(ck); hit != nil {
+			entry := usage.Entry{
+				RequestID: reqID, TS: start, VirtualModel: model,
+				KeyID: keyID(k), KeyName: keyName(k),
+				Provider: "cache", Model: candidates[0].Model,
+				Status: hit.status, Cached: true,
+				PromptTokens: hit.promptTokens, CompletionTokens: hit.completionTokens,
+				TotalTokens: hit.totalTokens,
+			}
+			zero := 0.0
+			entry.CostUSD = &zero
+			w.Header().Set("X-TokenRoute-Cache", "HIT")
+			w.Header().Set("X-TokenRoute-Decision", "provider=cache;model="+candidates[0].Model+
+				";strategy="+strategy+";attempts=0")
+			if hit.contentType != "" {
+				w.Header().Set("Content-Type", hit.contentType)
+			}
+			w.WriteHeader(hit.status)
+			_, _ = w.Write(hit.body)
+			entry.LatencyMs = time.Since(start).Milliseconds()
+			s.logEntry(r.Context(), entry)
+			return
+		}
+	}
+
+	// Phase 3: failover across ordered candidates; each tried at most once.
+	var resp *http.Response
+	var cand router.Candidate
+	var lastErr error
+	var lastFailResp *http.Response
+	var attempts int
+	fused := false
+	if strategy == router.StrategyFusion && !stream && len(candidates) > 1 {
+		cand, resp, lastFailResp, lastErr, attempts = s.fusionRun(r.Context(), hdr, body, candidates[:2])
+		fused = true
+	} else {
+		cand, resp, lastFailResp, lastErr, attempts = s.failover(r.Context(), hdr, body, candidates, chatCall)
+	}
 	setDecisionHeader(w, cand, strategy, attempts)
+	if fused {
+		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")
+	}
 	if resp == nil {
 		entry := usage.Entry{
 			RequestID: reqID, TS: start, VirtualModel: model,
@@ -298,14 +382,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Stream: stream, Status: http.StatusBadGateway,
 			LatencyMs: time.Since(start).Milliseconds(),
 		}
-		if lastFailResp != nil {
-			// All candidates failed with retryable upstream statuses:
-			// relay the last one as-is (Phase 1 transparency).
-			entry.Status = lastFailResp.StatusCode
-			s.relayFull(w, lastFailResp, &entry)
-		} else {
-			writeErr(w, http.StatusBadGateway, "upstream error: "+lastErr.Error(), "upstream_error")
-		}
+		s.relayAllFailed(w, &entry, lastFailResp, lastErr)
 		entry.LatencyMs = time.Since(start).Milliseconds()
 		s.logEntry(r.Context(), entry)
 		return
@@ -318,10 +395,11 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Provider: cand.Provider.Name(), Model: cand.Model,
 		Stream: stream, Status: resp.StatusCode,
 	}
+	var respBody []byte // captured for cache store (non-stream only)
 	if stream {
 		s.relayStream(w, resp, &entry)
 	} else {
-		s.relayFull(w, resp, &entry)
+		respBody = s.relayFull(w, resp, &entry)
 	}
 	entry.LatencyMs = time.Since(start).Milliseconds()
 	if p, ok := s.prices[cand.Model]; ok {
@@ -329,6 +407,69 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if hasBudget && entry.CostUSD != nil && *entry.CostUSD > budget {
 		entry.BudgetExceeded = true
+	}
+	if k != nil && entry.TotalTokens > 0 {
+		if s.limiter != nil {
+			s.limiter.DeductTPM(k.ID, k.TPM, entry.TotalTokens)
+		}
+		if err := s.keys.SpendTokens(k.ID, entry.TotalTokens); err != nil {
+			slog.Error("spend tokens", "err", err, "key_id", k.ID)
+		}
+	}
+	if ck != "" && respBody != nil && entry.Status == http.StatusOK && entry.TotalTokens > 0 {
+		s.cache.store(ck, &cacheEntry{
+			body: respBody, status: entry.Status,
+			contentType:      w.Header().Get("Content-Type"),
+			storedAt:         time.Now(),
+			promptTokens:     entry.PromptTokens,
+			completionTokens: entry.CompletionTokens,
+			totalTokens:      entry.TotalTokens,
+		})
+	}
+	s.logEntry(r.Context(), entry)
+}
+
+// embeddings relays POST /v1/embeddings to [OI]-compatible providers.
+// Same auth/ratelimit/quota and failover semantics as chat completions;
+// non-stream only. Cost uses embed_per_1m (fallback prompt_per_1m).
+func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	reqID := newRequestID()
+	w.Header().Set("X-Request-Id", reqID)
+
+	body, model, k, candidates, strategy, ok := s.prepareRequest(w, r)
+	if !ok {
+		return
+	}
+	cand, resp, lastFailResp, lastErr, attempts := s.failover(r.Context(), filterHeaders(r.Header), body, candidates, embedCall)
+	setDecisionHeader(w, cand, strategy, attempts)
+	if resp == nil {
+		entry := usage.Entry{
+			RequestID: reqID, TS: start, VirtualModel: model,
+			KeyID: keyID(k), KeyName: keyName(k),
+			Provider: cand.Provider.Name(), Model: cand.Model,
+			Status: http.StatusBadGateway,
+		}
+		s.relayAllFailed(w, &entry, lastFailResp, lastErr)
+		entry.LatencyMs = time.Since(start).Milliseconds()
+		s.logEntry(r.Context(), entry)
+		return
+	}
+	defer resp.Body.Close()
+
+	entry := usage.Entry{
+		RequestID: reqID, TS: start, VirtualModel: model,
+		KeyID: keyID(k), KeyName: keyName(k),
+		Provider: cand.Provider.Name(), Model: cand.Model,
+		Status: resp.StatusCode,
+	}
+	s.relayFull(w, resp, &entry)
+	// Embeddings bill prompt tokens only.
+	entry.CompletionTokens = 0
+	entry.TotalTokens = entry.PromptTokens
+	entry.LatencyMs = time.Since(start).Milliseconds()
+	if p, ok := s.prices[cand.Model]; ok {
+		entry.CostUSD = usage.EmbedCost(entry.PromptTokens, &p)
 	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {
@@ -434,15 +575,16 @@ func (s *srv) logEntry(ctx context.Context, e usage.Entry) {
 
 // relayFull buffers the whole upstream body (non-stream), extracts usage,
 // then writes status+headers+body to the client. Upstream Content-Length is
-// dropped so Go recomputes it.
-func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage.Entry) {
+// dropped so Go recomputes it. Returns the relayed body (nil on read error)
+// for the response cache.
+func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage.Entry) []byte {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// Headers not sent yet; report as upstream error.
 		w.Header().Del("Content-Type")
 		writeErr(w, http.StatusBadGateway, "upstream error: "+err.Error(), "upstream_error")
 		entry.Status = http.StatusBadGateway
-		return
+		return nil
 	}
 	var parsed struct {
 		Usage *usage.Usage `json:"usage"`
@@ -474,6 +616,7 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
+	return body
 }
 
 // relayStream copies the upstream SSE stream to the client byte-for-byte,

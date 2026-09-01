@@ -124,3 +124,17 @@ routes:
         model: deepseek-chat
       - provider: openai
         model: gpt-4o-mini
+
+  - model: duo
+    strategy: fusion                # race first 2 candidates; fastest 200 wins,
+    candidates:                     # tie broken by lower price
+      - provider: deepseek
+        model: deepseek-chat
+      - provider: openai
+        model: gpt-4o-mini
+
+# Response cache (non-stream chat completions): identical requests within
+# ttl are served from memory with X-TokenRoute-Cache: HIT and zero cost.
+#cache:
+#  enabled: true
+#  ttl_seconds: 300

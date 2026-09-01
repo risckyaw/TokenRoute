@@ -22,6 +22,9 @@ func (f *fakeProvider) Models(context.Context) ([]string, error) {
 func (f *fakeProvider) ChatComplete(context.Context, *provider.Request) (*http.Response, error) {
 	return nil, nil
 }
+func (f *fakeProvider) Embed(context.Context, *provider.Request) (*http.Response, error) {
+	return nil, nil
+}
 
 func setup() (*Router, *fakeProvider, *fakeProvider, *fakeProvider) {
 	hi := &fakeProvider{name: "hi", priority: 1}

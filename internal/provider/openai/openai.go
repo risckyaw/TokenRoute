@@ -104,6 +104,39 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
 		p.pool.Cool(key)
+	} else {
+		p.pool.RecordUse(key)
+	}
+	return resp, nil
+}
+
+// Embed posts to {base}/embeddings with the model field rewritten.
+func (p *Provider) Embed(ctx context.Context, preq *provider.Request) (*http.Response, error) {
+	key, ok := p.pool.Pick()
+	if !ok {
+		return nil, fmt.Errorf("all API keys in cooldown")
+	}
+	body := rewriteModel(preq.Body, preq.Model)
+	url := p.baseURL + "/embeddings"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	p.setAuth(req, key)
+	for k, vs := range preq.Header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upstream request: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+		p.pool.Cool(key)
+	} else {
+		p.pool.RecordUse(key)
 	}
 	return resp, nil
 }

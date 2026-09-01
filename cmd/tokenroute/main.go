@@ -36,6 +36,7 @@ type serverState struct {
 	keys     *auth.Store
 	limiter  *ratelimit.Registry
 	adminKey string
+	cache    *server.RespCache
 }
 
 func buildState(cfg *config.Config) (*serverState, error) {
@@ -91,7 +92,7 @@ func buildState(cfg *config.Config) (*serverState, error) {
 	}
 	prices := make(map[string]usage.Price, len(cfg.Prices))
 	for m, pc := range cfg.Prices {
-		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M}
+		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M}
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
@@ -148,6 +149,7 @@ func main() {
 	state.keys = keys
 	state.limiter = ratelimit.NewRegistry()
 	state.adminKey = cfg.AdminKey
+	state.cache = server.NewCache(cfg.Cache.Enabled, cfg.Cache.TTLSeconds)
 	var current atomic.Pointer[serverState]
 	current.Store(state)
 
@@ -163,6 +165,7 @@ func main() {
 		server.NewWithOptions(server.Options{
 			Router: st.router, Usage: st.usage, Prices: st.prices,
 			Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
+			Cache:         st.cache,
 			SeparateAdmin: cfg.AdminListen != "",
 		}).ServeHTTP(w, r)
 	})
@@ -215,6 +218,13 @@ func main() {
 				nstate.keys = prev.keys
 				nstate.limiter = prev.limiter
 				nstate.adminKey = ncfg.AdminKey
+				// Keep the warm cache unless reload toggled it off or changed TTL.
+				nstate.cache = prev.cache
+				if !ncfg.Cache.Enabled {
+					nstate.cache = nil
+				} else if nstate.cache == nil {
+					nstate.cache = server.NewCache(true, ncfg.Cache.TTLSeconds)
+				}
 				current.Store(nstate)
 				log.Info("config reloaded",
 					"providers", len(ncfg.Providers),

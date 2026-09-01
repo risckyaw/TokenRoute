@@ -156,11 +156,11 @@ func TestAdminUsageExport_CSV(t *testing.T) {
 	if len(lines) != 2 { // header + 1 in-range row
 		t.Fatalf("rows = %d, want 2: %q", len(lines), rec.Body.String())
 	}
-	wantHeader := "id,ts,key_name,virtual_model,provider,model,prompt_tokens,completion_tokens,total_tokens,stream,status,latency_ms,cost_usd,budget_exceeded"
+	wantHeader := "id,ts,key_name,virtual_model,provider,model,prompt_tokens,completion_tokens,total_tokens,stream,status,latency_ms,cost_usd,budget_exceeded,cached"
 	if lines[0] != wantHeader {
 		t.Fatalf("header = %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "k1,auto,fake,up-model,10,5,15,false,200,42,0.001,true") {
+	if !strings.Contains(lines[1], "k1,auto,fake,up-model,10,5,15,false,200,42,0.001,true,false") {
 		t.Fatalf("data row = %q", lines[1])
 	}
 

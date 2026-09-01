@@ -89,3 +89,35 @@ func TestKeyPool_RoundRobin(t *testing.T) {
 		t.Fatal("all cooling should return ok=false")
 	}
 }
+
+// Fair-share: the key with fewer requests in its 60s window wins; ties
+// rotate in round-robin order.
+func TestKeyPool_FairShare(t *testing.T) {
+	pool := provider.NewKeyPool("a", "b")
+	pool.RecordUse("a")
+	pool.RecordUse("a")
+	k, ok := pool.Pick()
+	if !ok || k != "b" {
+		t.Fatalf("pick = %q,%v want b,true (a has more use)", k, ok)
+	}
+	pool.RecordUse(k)
+	// Now a=2, b=1: b still lower.
+	k, _ = pool.Pick()
+	if k != "b" {
+		t.Fatalf("pick = %q want b", k)
+	}
+	pool.RecordUse(k)
+	pool.RecordUse(k)
+	// a=2, b=3: a lower now.
+	k, _ = pool.Pick()
+	if k != "a" {
+		t.Fatalf("pick = %q want a", k)
+	}
+	// Tie at zero recorded use after window would reset: round-robin order.
+	fresh := provider.NewKeyPool("x", "y")
+	a1, _ := fresh.Pick()
+	a2, _ := fresh.Pick()
+	if a1 != "x" || a2 != "y" {
+		t.Fatalf("tie rotation = %q %q want x y", a1, a2)
+	}
+}

@@ -28,6 +28,10 @@ func (f *fakeProvider) ModelsURL() string { return "" }
 func (f *fakeProvider) Models(context.Context) ([]string, error) {
 	return nil, nil
 }
+func (f *fakeProvider) Embed(context.Context, *provider.Request) (*http.Response, error) {
+	return provider.UnsupportedEmbed(), nil
+}
+
 func (f *fakeProvider) ChatComplete(_ context.Context, req *provider.Request) (*http.Response, error) {
 	f.lastReqBody = req.Body
 	ct := "text/event-stream"

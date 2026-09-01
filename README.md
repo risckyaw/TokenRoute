@@ -13,7 +13,13 @@ speak one API.
   streamed unbuffered.
 - **Routing strategies** — priority, round_robin, least_latency, weighted,
   cost, lkgp (last-known-good provider), headroom (fewest requests in the
-  last 60s first), per virtual model.
+  last 60s first), fusion (race first two candidates, fastest/cheapest 200
+  wins), per virtual model.
+- **Response cache** — optional in-memory cache for non-stream chat
+  completions (`cache:` config block); hits return `X-TokenRoute-Cache: HIT`
+  with zero cost, tracked in the usage log.
+- **Embeddings** — `/v1/embeddings` passthrough with the same routing,
+  failover, keys, and metering as chat completions.
 - **Per-request budgets** — `X-Max-Cost-USD` header rejects requests whose
   worst-case estimate exceeds the budget (402 `budget_exceeded`); actual
   overruns flagged in the usage log.

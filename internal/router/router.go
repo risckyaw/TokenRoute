@@ -21,13 +21,14 @@ const (
 	StrategyCost         = "cost"
 	StrategyLKGP         = "lkgp" // last-known-good provider first
 	StrategyHeadroom     = "headroom"
+	StrategyFusion       = "fusion" // race first 2 candidates concurrently
 )
 
 // ValidStrategy reports whether s is a known strategy name.
 func ValidStrategy(s string) bool {
 	switch s {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
-		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom:
+		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion:
 		return true
 	}
 	return false

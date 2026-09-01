@@ -17,6 +17,7 @@ import (
 type Price struct {
 	PromptPer1M     float64 `yaml:"prompt_per_1m"`
 	CompletionPer1M float64 `yaml:"completion_per_1m"`
+	EmbedPer1M      float64 `yaml:"embed_per_1m"` // embeddings; 0 = fall back to PromptPer1M
 }
 
 // Entry is one logged request.
@@ -37,6 +38,7 @@ type Entry struct {
 	LatencyMs        int64     `json:"latency_ms"`
 	CostUSD          *float64  `json:"cost_usd"`
 	BudgetExceeded   bool      `json:"budget_exceeded"`
+	Cached           bool      `json:"cached"`
 }
 
 // KeyAggregate is the per-key usage rollup for the admin API.
@@ -54,6 +56,20 @@ func Cost(promptTokens, completionTokens int, p *Price) *float64 {
 		return nil
 	}
 	c := float64(promptTokens)/1e6*p.PromptPer1M + float64(completionTokens)/1e6*p.CompletionPer1M
+	return &c
+}
+
+// EmbedCost computes USD cost for an embeddings request; nil when price
+// unknown. Falls back to PromptPer1M when EmbedPer1M is unset.
+func EmbedCost(promptTokens int, p *Price) *float64 {
+	if p == nil {
+		return nil
+	}
+	per1m := p.EmbedPer1M
+	if per1m == 0 {
+		per1m = p.PromptPer1M
+	}
+	c := float64(promptTokens) / 1e6 * per1m
 	return &c
 }
 
@@ -94,7 +110,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	}
 	// Phase 4 columns; ALTER fails on existing DBs that have them, so add
 	// only when missing (checked via pragma).
-	for _, col := range []string{"key_id INTEGER", "key_name TEXT", "budget_exceeded INTEGER"} {
+	for _, col := range []string{"key_id INTEGER", "key_name TEXT", "budget_exceeded INTEGER", "cached INTEGER"} {
 		name := strings.SplitN(col, " ", 2)[0]
 		if !hasColumn(db, "usage_logs", name) {
 			if _, err := db.Exec(`ALTER TABLE usage_logs ADD COLUMN ` + col); err != nil {
@@ -141,12 +157,12 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 	}
 	_, err := l.db.ExecContext(ctx, `INSERT INTO usage_logs
 		(request_id, ts, key_id, key_name, virtual_model, provider, model, prompt_tokens,
-		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd, budget_exceeded)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 completion_tokens, total_tokens, stream, status, latency_ms, cost_usd, budget_exceeded, cached)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.RequestID, e.TS.UTC().Format(time.RFC3339Nano), e.KeyID, e.KeyName,
 		e.VirtualModel, e.Provider, e.Model,
 		e.PromptTokens, e.CompletionTokens, e.TotalTokens, boolInt(e.Stream),
-		e.Status, e.LatencyMs, cost, boolInt(e.BudgetExceeded))
+		e.Status, e.LatencyMs, cost, boolInt(e.BudgetExceeded), boolInt(e.Cached))
 	return err
 }
 
@@ -154,7 +170,7 @@ func (l *Logger) Log(ctx context.Context, e Entry) error {
 func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
 		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
-		COALESCE(budget_exceeded,0)
+		COALESCE(budget_exceeded,0), COALESCE(cached,0)
 		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -164,17 +180,18 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 	for rows.Next() {
 		var e Entry
 		var ts, keyName string
-		var stream, budget int
+		var stream, budget, cached int
 		var cost sql.NullFloat64
 		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
-			&e.Status, &e.LatencyMs, &cost, &budget); err != nil {
+			&e.Status, &e.LatencyMs, &cost, &budget, &cached); err != nil {
 			return nil, err
 		}
 		e.KeyName = keyName
 		e.TS, _ = time.Parse(time.RFC3339Nano, ts)
 		e.Stream = stream != 0
 		e.BudgetExceeded = budget != 0
+		e.Cached = cached != 0
 		if cost.Valid {
 			c := cost.Float64
 			e.CostUSD = &c
@@ -188,7 +205,7 @@ func (l *Logger) QueryRecent(limit int) ([]Entry, error) {
 func (l *Logger) ExportRows(from, to time.Time, fn func(Entry) error) error {
 	rows, err := l.db.Query(`SELECT id, request_id, ts, key_id, key_name, virtual_model, provider, model,
 		prompt_tokens, completion_tokens, total_tokens, stream, status, latency_ms, cost_usd,
-		COALESCE(budget_exceeded,0)
+		COALESCE(budget_exceeded,0), COALESCE(cached,0)
 		FROM usage_logs WHERE ts >= ? AND ts <= ? ORDER BY id`,
 		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -198,17 +215,18 @@ func (l *Logger) ExportRows(from, to time.Time, fn func(Entry) error) error {
 	for rows.Next() {
 		var e Entry
 		var ts, keyName string
-		var stream, budget int
+		var stream, budget, cached int
 		var cost sql.NullFloat64
 		if err := rows.Scan(&e.ID, &e.RequestID, &ts, &e.KeyID, &keyName, &e.VirtualModel, &e.Provider, &e.Model,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, &stream,
-			&e.Status, &e.LatencyMs, &cost, &budget); err != nil {
+			&e.Status, &e.LatencyMs, &cost, &budget, &cached); err != nil {
 			return err
 		}
 		e.KeyName = keyName
 		e.TS, _ = time.Parse(time.RFC3339Nano, ts)
 		e.Stream = stream != 0
 		e.BudgetExceeded = budget != 0
+		e.Cached = cached != 0
 		if cost.Valid {
 			c := cost.Float64
 			e.CostUSD = &c

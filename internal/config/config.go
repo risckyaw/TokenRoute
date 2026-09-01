@@ -40,6 +40,13 @@ type RouteConfig struct {
 type PriceConfig struct {
 	PromptPer1M     float64 `yaml:"prompt_per_1m"`
 	CompletionPer1M float64 `yaml:"completion_per_1m"`
+	EmbedPer1M      float64 `yaml:"embed_per_1m"` // optional; falls back to prompt_per_1m
+}
+
+// CacheConfig controls the in-memory semantic response cache.
+type CacheConfig struct {
+	Enabled    bool `yaml:"enabled"`
+	TTLSeconds int  `yaml:"ttl_seconds"` // default 300
 }
 
 type Config struct {
@@ -47,6 +54,7 @@ type Config struct {
 	AdminListen string                 `yaml:"admin_listen"` // optional dedicated admin listener
 	UsageDB     string                 `yaml:"usage_db"`
 	AdminKey    string                 `yaml:"admin_key"`
+	Cache       CacheConfig            `yaml:"cache"`
 	Providers   []ProviderConfig       `yaml:"providers"`
 	Routes      []RouteConfig          `yaml:"routes"`
 	Prices      map[string]PriceConfig `yaml:"prices"`
@@ -126,7 +134,7 @@ func (c *Config) Validate() error {
 // validStrategy mirrors router strategy names; kept local to avoid an import.
 func validStrategy(s string) bool {
 	switch s {
-	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom":
+	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion":
 		return true
 	}
 	return false

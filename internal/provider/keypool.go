@@ -9,13 +9,25 @@ import (
 // KeyCooldown is how long a key is skipped after an upstream 401/429.
 const KeyCooldown = 60 * time.Second
 
-// KeyPool round-robins API keys per request, skipping keys in cooldown.
+// KeyPool picks API keys fairly, skipping keys in cooldown.
+//
+// Fair-share: among non-cooling keys the one with the lowest REQUEST COUNT
+// in its own 60s tumbling window wins (ties break in round-robin order).
+// Request count is used instead of tokens because the passthrough providers
+// do not parse response usage at the key level; call RecordUse after a
+// successful (non-401/429) response.
 type KeyPool struct {
 	keys []string
 	next atomic.Uint64
 
 	mu   sync.Mutex
-	cool map[string]time.Time // key -> cooling until
+	cool map[string]time.Time  // key -> cooling until
+	use  map[string]*keyWindow // key -> 60s tumbling request count
+}
+
+type keyWindow struct {
+	start time.Time
+	reqs  int
 }
 
 // NewKeyPool builds a pool; empty/blank keys are dropped. A nil/empty pool
@@ -27,11 +39,11 @@ func NewKeyPool(keys ...string) *KeyPool {
 			out = append(out, k)
 		}
 	}
-	return &KeyPool{keys: out, cool: map[string]time.Time{}}
+	return &KeyPool{keys: out, cool: map[string]time.Time{}, use: map[string]*keyWindow{}}
 }
 
-// Pick returns the next non-cooling key, or ("", false) when all keys are
-// cooling. An empty pool returns ("", true) — no key needed.
+// Pick returns the least-used non-cooling key, or ("", false) when all keys
+// are cooling. An empty pool returns ("", true) — no key needed.
 func (p *KeyPool) Pick() (string, bool) {
 	if len(p.keys) == 0 {
 		return "", true
@@ -39,14 +51,59 @@ func (p *KeyPool) Pick() (string, bool) {
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for range p.keys {
-		k := p.keys[int(p.next.Add(1)-1)%len(p.keys)]
+	// Round-robin scan order so ties rotate.
+	start := int(p.next.Load() % uint64(len(p.keys)))
+	best := -1
+	bestReqs := 0
+	for i := range p.keys {
+		idx := (start + i) % len(p.keys)
+		k := p.keys[idx]
 		if until, ok := p.cool[k]; ok && now.Before(until) {
 			continue
 		}
-		return k, true
+		reqs := p.windowReqs(k, now)
+		if best < 0 || reqs < bestReqs {
+			best, bestReqs = idx, reqs
+		}
 	}
-	return "", false
+	if best < 0 {
+		return "", false
+	}
+	p.next.Store(uint64(best + 1))
+	return p.keys[best], true
+}
+
+// windowReqs returns the key's current-window request count, resetting the
+// window when 60s elapsed. Caller holds p.mu.
+func (p *KeyPool) windowReqs(k string, now time.Time) int {
+	w := p.use[k]
+	if w == nil {
+		return 0
+	}
+	if now.Sub(w.start) >= 60*time.Second {
+		w.start, w.reqs = now, 0
+	}
+	return w.reqs
+}
+
+// RecordUse increments the key's request count for the current 60s window.
+// Call after a response that did not cool the key.
+func (p *KeyPool) RecordUse(key string) {
+	if key == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	w := p.use[key]
+	if w == nil {
+		w = &keyWindow{start: now}
+		p.use[key] = w
+	}
+	if now.Sub(w.start) >= 60*time.Second {
+		w.start, w.reqs = now, 0
+	}
+	w.reqs++
 }
 
 // Cool marks a key unusable for KeyCooldown (upstream 401/429).

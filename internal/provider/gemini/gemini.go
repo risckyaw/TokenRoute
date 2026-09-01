@@ -375,6 +375,12 @@ func (t *streamTranslator) Read(p []byte) (int, error) {
 
 // ---- ChatComplete ----
 
+// Embed is unsupported here: the gateway exposes only the [OI] embeddings
+// shape; Gemini's embedContent differs, so return 501 rather than translate.
+func (p *Provider) Embed(context.Context, *provider.Request) (*http.Response, error) {
+	return provider.UnsupportedEmbed(), nil
+}
+
 func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*http.Response, error) {
 	key, ok := p.pool.Pick()
 	if !ok {
@@ -401,6 +407,8 @@ func (p *Provider) ChatComplete(ctx context.Context, preq *provider.Request) (*h
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
 		p.pool.Cool(key)
+	} else {
+		p.pool.RecordUse(key)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return resp, nil // relay upstream errors unmodified (gateway handles failover)

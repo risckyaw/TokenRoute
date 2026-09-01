@@ -224,7 +224,7 @@ func (s *srv) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{"id", "ts", "key_name", "virtual_model", "provider", "model",
 		"prompt_tokens", "completion_tokens", "total_tokens", "stream", "status",
-		"latency_ms", "cost_usd", "budget_exceeded"})
+		"latency_ms", "cost_usd", "budget_exceeded", "cached"})
 	err := s.usage.ExportRows(from, to, func(e usage.Entry) error {
 		cost := ""
 		if e.CostUSD != nil {
@@ -237,6 +237,7 @@ func (s *srv) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 			strconv.Itoa(e.PromptTokens), strconv.Itoa(e.CompletionTokens), strconv.Itoa(e.TotalTokens),
 			strconv.FormatBool(e.Stream), strconv.Itoa(e.Status),
 			strconv.FormatInt(e.LatencyMs, 10), cost, strconv.FormatBool(e.BudgetExceeded),
+			strconv.FormatBool(e.Cached),
 		})
 	})
 	cw.Flush()
