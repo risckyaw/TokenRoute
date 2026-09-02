@@ -121,6 +121,10 @@ routes:
   # lowest_usage: fewest observed tokens in the current minute first (LiteLLM
   #              lowest_tpm_rpm_v2); unseen candidates first, ties by priority.
   # p2c:         power-of-2-choices — 2 random candidates, least-loaded first.
+  # peak_ewma:   2 random candidates, lower decayed-ewma/weight score first
+  #              (Kong/Finagle peak-ewma; weight from candidate config).
+  # Latency EWMA decays with a 10s time constant; unseen providers seed with
+  # the mean of known latencies (slow-start — no thundering herd on add/recover).
   # reset_aware: candidates whose quota window resets soonest first.
   # fill_first:  keep priority order; sink quota-exhausted candidates (pairs
   #              with free_tier: maximize one free tier before the next).

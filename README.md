@@ -185,12 +185,20 @@ curl -N localhost:8400/v1/chat/completions \
 |----------------|------------------------------------------------------|-------------|
 | `priority`     | First candidate by provider priority (default)       | Preferred provider with fallback |
 | `round_robin`  | Rotates the starting candidate each request          | Even spread across equivalent providers |
-| `least_latency`| Lowest EMA latency first; unseen providers first     | Latency-sensitive traffic |
+| `least_latency`| Lowest decayed-EWMA latency first; unseen providers seed with the mean of known latencies (slow-start, Kong-style) | Latency-sensitive traffic |
+| `peak_ewma`    | Draws 2 random candidates, lower decayed-ewma/weight score first; rest priority order | Latency+weight balancing without global sorts |
 | `weighted`     | Weighted-random first pick (weight default 1); rest stay in priority order | Gradual traffic shifts / canary |
 | `cost`         | Lowest prompt+completion price first; unpriced last  | Cost optimization |
 | `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
 | `headroom`     | Fewest requests in the last 60s first; ties -> priority | Load-aware spreading |
 | `lowest_usage` | Fewest observed tokens in the current minute first; unseen first, ties -> priority | Token-budget-aware spreading |
+
+Latency EWMA now decays lazily with a 10s time constant (Kong
+`balancer/latency.lua`): stale latency readings fade instead of pinning a
+provider forever. Slow-start: a provider with no data is scored with the
+MEAN of providers that do (no more thundering-herd onto freshly added or
+circuit-recovered providers). This intentionally changes `least_latency`,
+`p2c`/`peak_ewma`, and `auto` ordering.
 
 Failover applies to all strategies: 429/500/502/503/504 and transport
 errors try the next candidate (each tried at most once per request). Other

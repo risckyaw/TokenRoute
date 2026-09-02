@@ -67,11 +67,11 @@ func TestStrategyLeastLatency(t *testing.T) {
 	if got[0] != "a" {
 		t.Fatalf("unseen: first = %v, want a", got)
 	}
-	// a slow, b fast, c unseen (0 -> first).
+	// a slow, b fast, c unseen (slow-start: seeded with mean 255 -> middle).
 	r.RecordResult("a", 500*time.Millisecond, true)
 	r.RecordResult("b", 10*time.Millisecond, true)
 	got = names(r.OrderCandidates(rt))
-	want := []string{"c", "b", "a"}
+	want := []string{"b", "c", "a"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)

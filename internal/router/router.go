@@ -2,6 +2,7 @@
 package router
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +28,7 @@ const (
 	StrategyFillFirst    = "fill_first"  // exhaust first candidate's quota before moving on
 	StrategyAuto         = "auto"        // composite multi-factor scoring (OmniRoute port)
 	StrategyLowestUsage  = "lowest_usage" // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
+	StrategyPeakEWMA     = "peak_ewma"   // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -34,13 +36,24 @@ func ValidStrategy(s string) bool {
 	switch s {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
 		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
-		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage:
+		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage,
+		StrategyPeakEWMA:
 		return true
 	}
 	return false
 }
 
 const emaAlpha = 0.3
+
+// ewmaDecayTime is the lazy time-decay constant for latency EWMA (Kong
+// balancer/latency.lua DECAY_TIME = 10s): ewma *= exp(-dt/10s) on read/write.
+const ewmaDecayTime = 10 * time.Second
+
+// latencyState is a lazily time-decayed EWMA sample (Kong latency.lua).
+type latencyState struct {
+	ewma        float64
+	lastTouched time.Time
+}
 
 type Candidate struct {
 	Provider provider.Provider
@@ -97,8 +110,8 @@ type Router struct {
 	AffinityDefault bool
 	byName    map[string]provider.Provider
 	circuits  map[string]*CircuitBreaker
-	latency   map[string]float64 // EMA latency ms per provider name
-	errRate   map[string]float64 // EMA error rate 0..1 per provider name
+	latency   map[string]*latencyState // decayed-EWMA latency ms per provider name
+	errRate   map[string]float64        // EMA error rate 0..1 per provider name
 	prices    map[string]usage.Price
 	mappings  map[string]map[string]string // provider name -> alias -> upstream model
 	priceMu   sync.RWMutex                 // guards prices
@@ -199,7 +212,7 @@ func New(providers []provider.Provider, routes []*Route) *Router {
 		routes:    routes,
 		byName:    byName,
 		circuits:  map[string]*CircuitBreaker{},
-		latency:   map[string]float64{},
+		latency:   map[string]*latencyState{},
 		errRate:   map[string]float64{},
 		modelLock: map[string]time.Time{},
 		windows:   map[string]*window{},
@@ -372,16 +385,23 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 			allowed = append(rotated, allowed[:start]...)
 		}
 	case StrategyLeastLatency:
-		r.latMu.Lock()
-		lat := make(map[string]float64, len(r.latency))
-		for k, v := range r.latency {
-			lat[k] = v
+		// Decayed EWMA ascending. Slow-start: unseen providers seed with the
+		// MEAN of known EWMAs (Kong calculate_slow_start_ewma) instead of
+		// getting all traffic instantly; no data anywhere -> priority order.
+		lat, seed, hasData := r.latencySnapshot()
+		if hasData {
+			sort.SliceStable(allowed, func(i, j int) bool {
+				li, ok := lat[allowed[i].Provider.Name()]
+				if !ok {
+					li = seed
+				}
+				lj, ok2 := lat[allowed[j].Provider.Name()]
+				if !ok2 {
+					lj = seed
+				}
+				return li < lj
+			})
 		}
-		r.latMu.Unlock()
-		sort.SliceStable(allowed, func(i, j int) bool {
-			li, lj := lat[allowed[i].Provider.Name()], lat[allowed[j].Provider.Name()]
-			return li < lj // unseen providers (EMA=0) first
-		})
 	case StrategyWeighted:
 		if len(allowed) > 1 {
 			total := 0
@@ -462,6 +482,47 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 			}
 			allowed = append([]Candidate{winner, loser}, rest...)
 		}
+	case StrategyPeakEWMA:
+		// Kong/Finagle peak-ewma: draw 2 candidates at random (PICK_SET_SIZE=2),
+		// the lower decayed-ewma/weight score goes first; rest priority order.
+		// Slow-start: unseen scores with the mean seed; no data -> priority.
+		if len(allowed) > 1 {
+			lat, seed, hasData := r.latencySnapshot()
+			if hasData {
+				score := func(c Candidate) float64 {
+					v, ok := lat[c.Provider.Name()]
+					if !ok {
+						v = seed
+					}
+					w := c.Weight
+					if w <= 0 {
+						w = 1
+					}
+					return v / float64(w)
+				}
+				rt.mu.Lock()
+				if rt.randSrc == nil {
+					rt.randSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
+				}
+				i := rt.randSrc.Intn(len(allowed))
+				j := rt.randSrc.Intn(len(allowed) - 1)
+				if j >= i {
+					j++
+				}
+				rt.mu.Unlock()
+				winner, loser := allowed[i], allowed[j]
+				if score(loser) < score(winner) {
+					winner, loser = loser, winner
+				}
+				rest := make([]Candidate, 0, len(allowed)-1)
+				for k, c := range allowed {
+					if k != i && k != j {
+						rest = append(rest, c)
+					}
+				}
+				allowed = append([]Candidate{winner, loser}, rest...)
+			}
+		}
 	case StrategyResetAware:
 		// Prefer candidates whose quota window resets soonest; unknown quota
 		// sorts last (no signal). Ties keep priority order.
@@ -500,15 +561,12 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 		// zero disqualifies. Factors: health (1 - errRate), latency, cost,
 		// quota headroom. Circuit open / model lock already filtered above.
 		r.latMu.Lock()
-		lat := make(map[string]float64, len(r.latency))
-		for k, v := range r.latency {
-			lat[k] = v
-		}
 		errs := make(map[string]float64, len(r.errRate))
 		for k, v := range r.errRate {
 			errs[k] = v
 		}
 		r.latMu.Unlock()
+		lat, seed, hasLat := r.latencySnapshot()
 		type scored struct {
 			c     Candidate
 			score float64
@@ -518,7 +576,11 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 			name := c.Provider.Name()
 			health := 1 - clamp01(errs[name])
 			latencyF := 1.0
-			if l, ok := lat[name]; ok && l > 0 {
+			l, ok := lat[name]
+			if !ok && hasLat {
+				l = seed // slow-start: unseen gets the mean, not a free pass
+			}
+			if l > 0 {
 				latencyF = 1 - minF(l/50_000, 0.6) // 50s+ -> floor 0.4
 			}
 			costF := 1.0
@@ -574,6 +636,51 @@ func (r *Router) costKey(c Candidate) float64 {
 	return 1e18
 }
 
+// decayedEWMA returns the provider's latency EWMA decayed to now
+// (w = exp(-dt/10s); Kong latency.lua). Caller holds latMu.
+func (r *Router) decayedEWMA(name string, now time.Time) (float64, bool) {
+	st := r.latency[name]
+	if st == nil {
+		return 0, false
+	}
+	w := decayWeight(now.Sub(st.lastTouched))
+	return st.ewma * w, true
+}
+
+// decayWeight is exp(-dt/DECAY_TIME) with dt floored at 0.
+func decayWeight(dt time.Duration) float64 {
+	if dt <= 0 {
+		return 1
+	}
+	return math.Exp(-dt.Seconds() / ewmaDecayTime.Seconds())
+}
+
+// latencySnapshot returns decayed EWMAs for all providers plus the slow-start
+// seed: the MEAN of providers with data (Kong calculate_slow_start_ewma).
+// Unseen providers are absent from the map; callers substitute seed.
+// hasData=false when NO provider has data (all equal -> priority order).
+func (r *Router) latencySnapshot() (lat map[string]float64, seed float64, hasData bool) {
+	r.latMu.Lock()
+	defer r.latMu.Unlock()
+	now := time.Now()
+	lat = make(map[string]float64, len(r.latency))
+	var sum float64
+	var n int
+	for name := range r.latency {
+		v, ok := r.decayedEWMA(name, now)
+		if !ok {
+			continue
+		}
+		lat[name] = v
+		sum += v
+		n++
+	}
+	if n == 0 {
+		return lat, 0, false
+	}
+	return lat, sum / float64(n), true
+}
+
 // RecordResult updates the EMA latency, circuit breaker, and (for lkgp
 // routes) the last-known-good provider. Called by the server after each
 // attempt.
@@ -586,13 +693,21 @@ func (r *Router) RecordResult(providerName string, latency time.Duration, succes
 // skip the circuit breaker while still recording latency for observability.
 func (r *Router) RecordResultKind(providerName string, latency time.Duration, success bool, kind FailureKind, countsAgainstProvider bool) {
 	r.latMu.Lock()
-	cur := r.latency[providerName]
-	if cur == 0 {
-		cur = float64(latency.Milliseconds())
-	} else {
-		cur = emaAlpha*float64(latency.Milliseconds()) + (1-emaAlpha)*cur
+	now := time.Now()
+	st := r.latency[providerName]
+	if st == nil {
+		st = &latencyState{}
+		r.latency[providerName] = st
 	}
-	r.latency[providerName] = cur
+	rtt := float64(latency.Milliseconds())
+	if st.lastTouched.IsZero() {
+		st.ewma = rtt
+	} else {
+		// Lazy decay to now, then EMA blend (Kong latency.lua).
+		w := decayWeight(now.Sub(st.lastTouched))
+		st.ewma = st.ewma*w + rtt*(1-w)
+	}
+	st.lastTouched = now
 	if success {
 		r.errRate[providerName] = (1 - emaAlpha) * r.errRate[providerName]
 	} else if countsAgainstProvider {
@@ -603,7 +718,7 @@ func (r *Router) RecordResultKind(providerName string, latency time.Duration, su
 		w = &window{}
 		r.windows[providerName] = w
 	}
-	if now := time.Now(); now.Sub(w.start) >= 60*time.Second {
+	if now.Sub(w.start) >= 60*time.Second {
 		w.start, w.reqs, w.toks = now, 1, 0
 	} else {
 		w.reqs++
@@ -701,11 +816,12 @@ func (r *Router) ProviderDisabled(providerName string) bool {
 	return false
 }
 
-// LatencyMs returns the EMA latency in ms for a provider (0 if unseen).
+// LatencyMs returns the decayed EWMA latency in ms for a provider (0 if unseen).
 func (r *Router) LatencyMs(providerName string) float64 {
 	r.latMu.Lock()
 	defer r.latMu.Unlock()
-	return r.latency[providerName]
+	v, _ := r.decayedEWMA(providerName, time.Now())
+	return v
 }
 
 // WindowReqs returns the provider's request count in the current 60s window
