@@ -69,6 +69,27 @@ func (b *TokenBucket) Remaining() int {
 	return int(b.tokens)
 }
 
+// RetryAfterSeconds returns seconds until the bucket refills enough for one
+// token (Kong writes Retry-After on its own 429s). 0 for unlimited buckets
+// or when a token is already available; rounded up, min 1 when denying.
+func (b *TokenBucket) RetryAfterSeconds() int {
+	if b.capacity <= 0 || b.rate <= 0 {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refill()
+	if b.tokens >= 1 {
+		return 0
+	}
+	secs := (1 - b.tokens) / b.rate
+	s := int(secs + 0.999999) // ceil
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
 // Deduct removes n tokens unconditionally, flooring at 0. Used to charge
 // actual usage after a request completes.
 func (b *TokenBucket) Deduct(n int) {
@@ -123,6 +144,39 @@ func (r *Registry) TPMRemaining(keyID int64, tpm int) int {
 		return 1 << 62
 	}
 	return r.get(keyID, 0, tpm).tpm.Remaining()
+}
+
+// RPMRetryAfter returns seconds until the RPM bucket allows one request
+// (0 when rpm is 0 or a token is available now).
+func (r *Registry) RPMRetryAfter(keyID int64, rpm int) int {
+	if rpm <= 0 {
+		return 0
+	}
+	return r.get(keyID, rpm, 0).rpm.RetryAfterSeconds()
+}
+
+// TPMRetryAfter returns seconds until the TPM bucket holds one token.
+func (r *Registry) TPMRetryAfter(keyID int64, tpm int) int {
+	if tpm <= 0 {
+		return 0
+	}
+	return r.get(keyID, 0, tpm).tpm.RetryAfterSeconds()
+}
+
+// ModelRPMRetryAfter returns seconds until the per-(key,model) bucket allows
+// one request; 0 when modelRPM is 0.
+func (r *Registry) ModelRPMRetryAfter(keyID int64, model string, modelRPM int) int {
+	if modelRPM <= 0 {
+		return 0
+	}
+	ns := strconv.FormatInt(keyID, 10) + ":" + model
+	r.mu.Lock()
+	b, ok := r.modelRPM[ns]
+	r.mu.Unlock()
+	if !ok {
+		return 0
+	}
+	return b.RetryAfterSeconds()
 }
 
 // DeductTPM charges n actual tokens after a request; no-op when tpm is 0.

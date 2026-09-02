@@ -112,7 +112,9 @@ speak one API.
 - **Virtual API keys** — per-key RPM/TPM token buckets, lifetime quotas,
   model allowlists, expiry; full admin API. Rate limits surfaced via
   `RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset` (RPM) and
-  `X-RateLimit-Token-*` (TPM) response headers; 429s carry `Retry-After`.
+  `X-RateLimit-Token-*` (TPM) response headers; 429s carry `Retry-After` +
+  `RateLimit-Reset` computed from the bucket's refill rate (seconds until
+  one token is available, Kong-style) instead of a flat 60.
   Optional `limit_by_header` on a key derives the rate-limit identity from
   a request header (e.g. `X-User-Id`) so one key serves many end-users
   with isolated buckets (Kong-style `limit_by`). Optional `daily_quota`

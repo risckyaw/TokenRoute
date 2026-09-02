@@ -307,6 +307,16 @@ func timeoutOverride(next http.Handler) http.Handler {
 	})
 }
 
+// setRetryAfter writes Retry-After + RateLimit-Reset from a bucket-derived
+// hint (Kong: own 429s carry Retry-After). secs <= 0 (unknown) -> 60s.
+func setRetryAfter(w http.ResponseWriter, secs int) {
+	if secs <= 0 {
+		secs = 60
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	w.Header().Set("RateLimit-Reset", strconv.Itoa(secs))
+}
+
 // secondsUntilMidnightUTC is the Retry-After hint for daily quota resets.
 func secondsUntilMidnightUTC() int {
 	now := time.Now().UTC()
@@ -448,17 +458,17 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			}
 			if k.ModelRPM > 0 {
 				if !s.limiter.AllowModelRPM(limID, model, k.ModelRPM) {
-					w.Header().Set("Retry-After", "60")
+					setRetryAfter(w, s.limiter.ModelRPMRetryAfter(limID, model, k.ModelRPM))
 					writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 					return nil, "", nil, nil, "", 1, false
 				}
 			} else if !s.limiter.AllowRPM(limID, k.RPM) {
-				w.Header().Set("Retry-After", "60")
+				setRetryAfter(w, s.limiter.RPMRetryAfter(limID, k.RPM))
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
 			}
 			if s.limiter.TPMRemaining(limID, k.TPM) <= 0 {
-				w.Header().Set("Retry-After", "60")
+				setRetryAfter(w, s.limiter.TPMRetryAfter(limID, k.TPM))
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 				return nil, "", nil, nil, "", 1, false
 			}
