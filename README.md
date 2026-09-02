@@ -271,6 +271,27 @@ the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
 
+## Capability-aware routing
+
+Requests carrying non-text content are ranked onto models that can actually
+accept them (9router `detectRequiredCapabilities`). The gateway scans the chat
+body's content blocks — `image_url`/`image`/`input_image` → image,
+`input_audio`/`audio_url`/`audio` → audio, `file`/`document`/`input_file` → the
+mime type found in `media_type`/`mime_type` or a `data:<mime>;base64,` prefix
+(`image/*`, `application/pdf`, `audio/*`, `video/*`; a file block with no
+discoverable mime falls back to PDF) — then stable-sorts candidates whose
+models cover every requirement ahead of the rest. Requirements are listed in
+the decision header as `;caps=image,pdf`.
+
+Modality data comes from the models.dev catalog sync, so `model_catalog: off`
+disables the reordering (detection still runs, and the marker is still set).
+Candidates are never dropped: a model with no catalog entry can still serve
+text-only requests normally and is only ranked last when media is required —
+a route whose models are all uncatalogued behaves exactly as before. Tiering
+is applied after the strategy and is stable, so it overrides
+cost/latency/quota preference (a text-only model is a guaranteed 400) while
+preserving the strategy's order within each tier.
+
 ## Sticky round-robin
 
 `strategy: round_robin` with `sticky: N` (9router `getRotatedModels`) advances

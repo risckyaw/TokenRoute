@@ -290,9 +290,12 @@ routes:
 #  enabled: true
 #  ttl_seconds: 300
 
-# Daily model-capability sync from models.dev (context windows, strictly
-# additive below the hand-written price table). Default: on. Cache file
-# lands beside usage_db as model-catalog.json.
+# Daily model-capability sync from models.dev (context windows + input
+# modalities, strictly additive below the hand-written price table). Default:
+# on. Cache file lands beside usage_db as model-catalog.json. The synced
+# modalities also drive capability-aware routing: a request containing an
+# image/audio/pdf block ranks candidates whose models accept it first
+# (decision header ;caps=image). "off" disables both.
 #model_catalog: off
 
 # POST /v1/search — web search with per-backend key pools, tried in order

@@ -55,6 +55,9 @@ type serverState struct {
 	maxBodyMB    int
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
+	// modalities: model -> synced input modalities (catalog sync); nil when the
+	// catalog is off. Survives reloads so the swapped router keeps the lookup.
+	modalities func(string) ([]string, bool)
 }
 
 // buildState builds a fresh server state. sharedPrices nil (startup) creates
@@ -343,12 +346,15 @@ func main() {
 	bindMetrics(mreg, state.router)
 
 	// Daily model-capability sync (models.dev) — strictly additive below
-	// the hand-written price table; "off" disables.
+	// the hand-written price table; "off" disables. Its per-model input
+	// modalities also feed capability-aware candidate ordering.
 	if !strings.EqualFold(cfg.ModelCatalog, "off") {
 		syncer := catalog.NewSyncer(
 			filepath.Join(filepath.Dir(cfg.UsageDB), "model-catalog.json"),
 			"", 0, state.prices,
 		)
+		state.modalities = syncer.Modalities
+		state.router.SetModalityLookup(syncer.Modalities)
 		go syncer.Run(context.Background())
 	}
 
@@ -443,6 +449,12 @@ func main() {
 				nstate.adminKey = ncfg.AdminKey
 				nstate.metrics = prev.metrics
 				bindMetrics(prev.metrics, nstate.router)
+				// The catalog syncer outlives reloads: re-point the new router
+				// at its modality lookup.
+				nstate.modalities = prev.modalities
+				if prev.modalities != nil {
+					nstate.router.SetModalityLookup(prev.modalities)
+				}
 				// Keep the warm cache unless reload toggled it off or changed TTL.
 				nstate.cache = prev.cache
 				if !ncfg.Cache.Enabled {

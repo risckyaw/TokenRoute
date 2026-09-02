@@ -88,3 +88,26 @@ func TestSyncOnceETag(t *testing.T) {
 		t.Fatalf("want 2 upstream hits, got %d", hits)
 	}
 }
+
+// Modalities exposes synced non-text input modalities for capability routing;
+// unknown models must report ok=false, not an empty (text-only) list.
+func TestModalitiesLookup(t *testing.T) {
+	s := NewSyncer(filepath.Join(t.TempDir(), "cat.json"), "", 0, map[string]usage.Price{})
+	s.merge(parse([]byte(sample)))
+
+	mods, ok := s.Modalities("gpt-9")
+	if !ok || len(mods) != 1 || mods[0] != "image" {
+		t.Fatalf("gpt-9 modalities = %v ok=%v, want [image] true", mods, ok)
+	}
+	// Vendor prefix / :suffix normalization matches the sync.
+	if mods, ok := s.Modalities("openai/GPT-9:free"); !ok || len(mods) != 1 {
+		t.Fatalf("normalized lookup = %v ok=%v", mods, ok)
+	}
+	// Text-only model: known, with no non-text modalities.
+	if mods, ok := s.Modalities("glm-9.9"); !ok || len(mods) != 0 {
+		t.Fatalf("glm-9.9 modalities = %v ok=%v, want [] true", mods, ok)
+	}
+	if _, ok := s.Modalities("never-synced"); ok {
+		t.Fatal("unknown model must report ok=false")
+	}
+}

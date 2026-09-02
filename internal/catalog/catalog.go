@@ -204,6 +204,21 @@ func (s *Syncer) SyncOnce(ctx context.Context) error {
 	return nil
 }
 
+// Modalities returns a model's synced non-text input modalities (image, pdf,
+// audio, video). ok=false when the catalog has no entry for the model, which
+// callers must treat as "unknown", not "text-only". Model ids are normalized
+// the same way as the sync (vendor prefix and :suffix stripped, lowercased),
+// so upstream names like "openai/gpt-4o:free" resolve.
+func (s *Syncer) Modalities(model string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.models[baseID(model)]
+	if !ok {
+		return nil, false
+	}
+	return e.Modalities, true
+}
+
 // Run starts the daily sync loop until ctx cancels. First sync after a
 // 60s startup delay so the server serves requests before fetching.
 func (s *Syncer) Run(ctx context.Context) {

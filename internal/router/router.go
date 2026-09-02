@@ -163,6 +163,9 @@ type Router struct {
 	affinity  *AffinityCache       // prompt-prefix pinning (nil = disabled)
 	// overrides: provider name -> set-only body/header ops (new-api port).
 	overrides map[string]ProviderOverride
+	// modalities: model -> supported non-text input modalities, from the
+	// models.dev catalog sync; nil disables capability-aware reordering.
+	modalities func(model string) ([]string, bool)
 }
 
 // ProviderOverride carries a provider's set-only request mutations.
@@ -401,6 +404,13 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 // ring value (already resolved from the request: header value or API key).
 // Empty = no ring rotation (priority order).
 func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue string) []Candidate {
+	return r.OrderCandidatesCaps(rt, sel, hashValue, nil)
+}
+
+// OrderCandidatesCaps is OrderCandidatesHash plus the modalities the request
+// body requires (see DetectRequiredModalities); empty/nil = no capability
+// reordering.
+func (r *Router) OrderCandidatesCaps(rt *Route, sel *TagSelector, hashValue string, required []string) []Candidate {
 	allowed := make([]Candidate, 0, len(rt.Candidates))
 	// origIdx[i] is allowed[i]'s position in rt.Candidates — sticky round-robin
 	// rotates on the ORIGINAL list so filtering does not shift the cursor.
@@ -426,6 +436,7 @@ func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue stri
 				}
 			}
 		}
+		r.reorderByModalities(allowed, required)
 		return allowed
 	}
 	switch rt.Strategy {
@@ -716,6 +727,11 @@ func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue stri
 			allowed[i] = scores[i].c
 		}
 	}
+	// Capability tiering runs LAST so it wins over the strategy: a candidate
+	// that cannot accept the request's media is a guaranteed 400, which no
+	// latency/cost/quota preference outranks. The sort is stable, so the
+	// strategy's order survives within each tier.
+	r.reorderByModalities(allowed, required)
 	return allowed
 }
 

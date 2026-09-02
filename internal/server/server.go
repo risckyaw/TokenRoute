@@ -443,18 +443,18 @@ func embedCall(ctx context.Context, p provider.Provider, req *provider.Request) 
 // prepareRequest validates the body/model, applies per-key auth/ratelimit/
 // quota, and resolves ordered candidates. ok=false = error already written.
 // mult is the route cost multiplier (1.0 for passthrough requests).
-func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byte, model string, k *auth.Key, candidates []router.Candidate, strategy string, mult float64, ok bool) {
+func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byte, model string, k *auth.Key, candidates []router.Candidate, strategy string, mult float64, caps []string, ok bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBody))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
-		return nil, "", nil, nil, "", 1, false
+		return nil, "", nil, nil, "", 1, nil, false
 	}
 	var parsed map[string]any
 	_ = json.Unmarshal(body, &parsed)
 	model, _ = parsed["model"].(string)
 	if model == "" {
 		writeErr(w, http.StatusBadRequest, "missing or empty \"model\" field", "invalid_request_error")
-		return nil, "", nil, nil, "", 1, false
+		return nil, "", nil, nil, "", 1, nil, false
 	}
 	// Global alias resolution (client name -> virtual route model) before
 	// auth checks and route lookup, so allowlists see the canonical target.
@@ -473,15 +473,15 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	if k != nil {
 		if !modelAllowed(k, model) {
 			writeErr(w, http.StatusForbidden, "model not allowed for this API key", "model_not_allowed")
-			return nil, "", nil, nil, "", 1, false
+			return nil, "", nil, nil, "", 1, nil, false
 		}
 		if k.QuotaTokens > 0 && k.SpentTokens >= k.QuotaTokens {
 			writeErr(w, http.StatusForbidden, "token quota exceeded", "quota_exceeded")
-			return nil, "", nil, nil, "", 1, false
+			return nil, "", nil, nil, "", 1, nil, false
 		}
 		if k.BudgetUSD > 0 && k.SpentUSD >= k.BudgetUSD {
 			writeErr(w, http.StatusPaymentRequired, "USD budget exhausted", "budget_exceeded")
-			return nil, "", nil, nil, "", 1, false
+			return nil, "", nil, nil, "", 1, nil, false
 		}
 		if k.DailyQuota > 0 {
 			remaining := k.DailyQuota - k.DailyUsed
@@ -493,7 +493,7 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 			if k.DailyUsed >= k.DailyQuota {
 				w.Header().Set("Retry-After", strconv.Itoa(secondsUntilMidnightUTC()))
 				writeErr(w, http.StatusTooManyRequests, "daily request quota exceeded", "daily_quota_exceeded")
-				return nil, "", nil, nil, "", 1, false
+				return nil, "", nil, nil, "", 1, nil, false
 			}
 		}
 		if s.limiter != nil {
@@ -518,17 +518,17 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 				if !s.limiter.AllowModelRPM(limID, model, k.ModelRPM) {
 					setRetryAfter(w, s.limiter.ModelRPMRetryAfter(limID, model, k.ModelRPM))
 					writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-					return nil, "", nil, nil, "", 1, false
+					return nil, "", nil, nil, "", 1, nil, false
 				}
 			} else if !s.limiter.AllowRPM(limID, k.RPM) {
 				setRetryAfter(w, s.limiter.RPMRetryAfter(limID, k.RPM))
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return nil, "", nil, nil, "", 1, false
+				return nil, "", nil, nil, "", 1, nil, false
 			}
 			if s.limiter.TPMRemaining(limID, k.TPM) <= 0 {
 				setRetryAfter(w, s.limiter.TPMRetryAfter(limID, k.TPM))
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
-				return nil, "", nil, nil, "", 1, false
+				return nil, "", nil, nil, "", 1, nil, false
 			}
 		}
 		if k.DailyQuota > 0 {
@@ -539,10 +539,13 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	}
 
 	mult = 1
+	// Capability-aware routing (9router detectRequiredCapabilities): a body
+	// carrying an image/audio/pdf block must not be sent to a text-only model.
+	caps = router.DetectRequiredModalities(body)
 	if rt := s.router.Resolve(model); rt != nil {
 		// Tag-based routing (LiteLLM tag_based_routing): X-Route-Tags header,
 		// comma-separated; plain = subset match, !tag excludes, &tag requires.
-		candidates = s.router.OrderCandidatesHash(rt, router.ParseTagSelector(r.Header.Get("X-Route-Tags")), hashRingValue(rt, r, k))
+		candidates = s.router.OrderCandidatesCaps(rt, router.ParseTagSelector(r.Header.Get("X-Route-Tags")), hashRingValue(rt, r, k), caps)
 		strategy = rt.Strategy
 		mult = rt.Multiplier
 	} else {
@@ -553,7 +556,7 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	}
 	if len(candidates) == 0 {
 		writeErr(w, http.StatusBadRequest, "no provider available for model: "+model, "invalid_request_error")
-		return nil, "", nil, nil, "", 1, false
+		return nil, "", nil, nil, "", 1, nil, false
 	}
 	// Group access: drop candidates whose groups don't intersect the key's
 	// groups (empty on either side = wildcard).
@@ -567,10 +570,10 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 		candidates = filtered
 		if len(candidates) == 0 {
 			writeErr(w, http.StatusForbidden, "no available channel for your group", "group_forbidden")
-			return nil, "", nil, nil, "", 1, false
+			return nil, "", nil, nil, "", 1, nil, false
 		}
 	}
-	return body, model, k, candidates, strategy, mult, true
+	return body, model, k, candidates, strategy, mult, caps, true
 }
 
 // groupRatioMultiplier multiplies the configured ratios of the groups
@@ -840,7 +843,7 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 		if next == nil {
 			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
 		}
-		candidates = s.router.OrderCandidatesHash(next, sel, hashRingValueHdr(next, clientHdr, keyStr))
+		candidates = s.router.OrderCandidatesCaps(next, sel, hashRingValueHdr(next, clientHdr, keyStr), router.DetectRequiredModalities(body))
 		if len(candidates) == 0 {
 			cur = next // skip routes with no usable candidates
 			continue
@@ -929,7 +932,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqID := newRequestID()
 	w.Header().Set("X-Request-Id", reqID)
 
-	body, model, k, candidates, strategy, mult, ok := s.prepareRequest(w, r)
+	body, model, k, candidates, strategy, mult, caps, ok := s.prepareRequest(w, r)
 	if !ok {
 		return
 	}
@@ -1012,6 +1015,11 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if fused {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")
+	}
+	if len(caps) > 0 {
+		// Capability requirements detected in the body (image/pdf/audio/video):
+		// candidates covering them were ranked first.
+		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";caps="+strings.Join(caps, ","))
 	}
 	if resp == nil && lastFailResp == nil && errors.Is(lastErr, errContextExceeded) {
 		// Every candidate rejected locally by the context-window guard.
@@ -1101,7 +1109,8 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	reqID := newRequestID()
 	w.Header().Set("X-Request-Id", reqID)
 
-	body, model, k, candidates, strategy, mult, ok := s.prepareRequest(w, r)
+	// Embeddings bodies carry no media content blocks: caps discarded.
+	body, model, k, candidates, strategy, mult, _, ok := s.prepareRequest(w, r)
 	if !ok {
 		return
 	}
