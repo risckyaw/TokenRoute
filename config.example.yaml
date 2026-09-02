@@ -125,6 +125,9 @@ routes:
   #              (Kong/Finagle peak-ewma; weight from candidate config).
   # least_connections: fewest live in-flight upstream requests first, scored
   #              (inflight+1)/weight — sees long SSE streams headroom can't.
+  # consistent_hash: stateless ring on a request value (Kong). Requires
+  #              hash_on: "header:X-Session-Id" (any header) or "key" (the
+  #              virtual API key). Missing value -> priority fallback.
   # Latency EWMA decays with a 10s time constant; unseen providers seed with
   # the mean of known latencies (slow-start — no thundering herd on add/recover).
   # reset_aware: candidates whose quota window resets soonest first.

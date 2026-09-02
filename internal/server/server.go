@@ -474,7 +474,7 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	if rt := s.router.Resolve(model); rt != nil {
 		// Tag-based routing (LiteLLM tag_based_routing): X-Route-Tags header,
 		// comma-separated; plain = subset match, !tag excludes, &tag requires.
-		candidates = s.router.OrderCandidatesTagged(rt, router.ParseTagSelector(r.Header.Get("X-Route-Tags")))
+		candidates = s.router.OrderCandidatesHash(rt, router.ParseTagSelector(r.Header.Get("X-Route-Tags")), hashRingValue(rt, r, k))
 		strategy = rt.Strategy
 		mult = rt.Multiplier
 	} else {
@@ -693,7 +693,7 @@ type affinityInfo struct {
 // (LiteLLM fallbacks): other virtual models tried in order, max 3 route
 // hops, cycles skipped via the visited set. Client errors (4xx relayed
 // as-is) never trigger fallback — failoverCtx returns those as resp != nil.
-func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string, clientHdr http.Header) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, aff affinityInfo) {
+func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string, clientHdr http.Header, keyStr string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, aff affinityInfo) {
 	sel := router.ParseTagSelector(tagHeader)
 	visited := map[string]bool{model: true}
 	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
@@ -772,7 +772,7 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 		if next == nil {
 			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
 		}
-		candidates = s.router.OrderCandidatesTagged(next, sel)
+		candidates = s.router.OrderCandidatesHash(next, sel, hashRingValueHdr(next, clientHdr, keyStr))
 		if len(candidates) == 0 {
 			cur = next // skip routes with no usable candidates
 			continue
@@ -796,6 +796,35 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			aff.hit = s.router.PinByAffinity(candidates, pinHash)
 		}
 	}
+}
+
+// hashRingValue resolves the consistent_hash ring value for a route:
+// hash_on "header:Name" -> that request header's value; "key" -> the
+// virtual API key string. Anything else/absent -> "" (priority fallback).
+func hashRingValue(rt *router.Route, r *http.Request, k *auth.Key) string {
+	return hashRingValueHdr(rt, r.Header, keyString(k))
+}
+
+// hashRingValueHdr is hashRingValue on a bare header + key string.
+func hashRingValueHdr(rt *router.Route, h http.Header, keyStr string) string {
+	if rt == nil || rt.Strategy != router.StrategyConsistentHash {
+		return ""
+	}
+	if name, ok := strings.CutPrefix(rt.HashOn, "header:"); ok && name != "" {
+		return h.Get(name)
+	}
+	if rt.HashOn == "key" {
+		return keyStr
+	}
+	return ""
+}
+
+// keyString extracts the raw key for hashing ("" when auth disabled).
+func keyString(k *auth.Key) string {
+	if k == nil {
+		return ""
+	}
+	return k.Key
 }
 
 // relayAllFailed writes the terminal response when every candidate failed:
@@ -897,7 +926,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// -> openai/claude/gemini weights).
 	est := estimateChatTokens(body, estimateFamily(s.providerTypes[candidates[0].Provider.Name()]))
 	var aff affinityInfo
-	cand, resp, lastFailResp, lastErr, attempts, fused, aff = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"), r.Header)
+	cand, resp, lastFailResp, lastErr, attempts, fused, aff = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"), r.Header, keyString(k))
 	setDecisionHeader(w, cand, strategy, attempts)
 	if aff.hit {
 		// ;affinity=hit kept for compatibility; ;aff=h|k marks the key source

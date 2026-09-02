@@ -2,6 +2,7 @@
 package router
 
 import (
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"sort"
@@ -30,6 +31,7 @@ const (
 	StrategyLowestUsage  = "lowest_usage" // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
 	StrategyPeakEWMA     = "peak_ewma"   // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
 	StrategyLeastConn    = "least_connections" // fewest in-flight upstream requests first (Kong)
+	StrategyConsistentHash = "consistent_hash" // stateless ring on a request value (Kong)
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -38,7 +40,7 @@ func ValidStrategy(s string) bool {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
 		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
 		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage,
-		StrategyPeakEWMA, StrategyLeastConn:
+		StrategyPeakEWMA, StrategyLeastConn, StrategyConsistentHash:
 		return true
 	}
 	return false
@@ -84,6 +86,10 @@ type Route struct {
 	AffinityKeyHeader string
 	// AffinityTTL: pin TTL for this route (0 = cache default 1h).
 	AffinityTTL time.Duration
+	// HashOn (consistent_hash strategy only): "header:X-Session-Id" or "key".
+	// The hashed value selects the starting candidate on a stateless ring;
+	// empty/missing value -> priority order.
+	HashOn string
 	// AffinitySkipRetry: on an affinity HIT, do not fail over to other
 	// candidates when the upstream call fails retryably — relay the failure.
 	// Rationale (new-api SkipRetryOnFailure): the pinned channel holds
@@ -357,6 +363,13 @@ func (r *Router) OrderCandidates(rt *Route) []Candidate {
 // OrderCandidatesTagged is OrderCandidates plus a request-scoped tag
 // selector (X-Route-Tags); nil = no tag filtering.
 func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate {
+	return r.OrderCandidatesHash(rt, sel, "")
+}
+
+// OrderCandidatesHash is OrderCandidatesTagged plus the consistent_hash
+// ring value (already resolved from the request: header value or API key).
+// Empty = no ring rotation (priority order).
+func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue string) []Candidate {
 	allowed := make([]Candidate, 0, len(rt.Candidates))
 	for _, c := range rt.Candidates {
 		if !sel.MatchTags(c.Tags) {
@@ -545,6 +558,22 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 		sort.SliceStable(allowed, func(i, j int) bool {
 			return score(allowed[i]) < score(allowed[j])
 		})
+	case StrategyConsistentHash:
+		// Kong consistent_hashing: stateless ring. Candidates sorted lexically
+		// by (provider,model); start at fnv32(value) % len and walk forward.
+		// Circuit-open/locked/tag-mismatched candidates are already excluded
+		// from `allowed`, so the walk is a rotation of the filtered ring.
+		// No hash value -> priority order unchanged.
+		if len(allowed) > 1 && hashValue != "" {
+			sort.SliceStable(allowed, func(i, j int) bool {
+				ki := allowed[i].Provider.Name() + "|" + allowed[i].Model
+				kj := allowed[j].Provider.Name() + "|" + allowed[j].Model
+				return ki < kj
+			})
+			start := int(fnv32(hashValue) % uint32(len(allowed)))
+			rotated := append([]Candidate(nil), allowed[start:]...)
+			allowed = append(rotated, allowed[:start]...)
+		}
 	case StrategyResetAware:
 		// Prefer candidates whose quota window resets soonest; unknown quota
 		// sorts last (no signal). Ties keep priority order.
@@ -636,6 +665,13 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 		}
 	}
 	return allowed
+}
+
+// fnv32 hashes a consistent_hash ring value (FNV-1a 32).
+func fnv32(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
 }
 
 func clamp01(v float64) float64 {

@@ -105,6 +105,10 @@ type RouteConfig struct {
 	// Affinity (new-api channel affinity port): extended pin config. Wins
 	// over PromptCacheAffinity when enabled is set.
 	Affinity *AffinityConfig `yaml:"affinity"`
+	// HashOn (consistent_hash strategy only): request value to hash.
+	// "header:X-Session-Id" (any header name) or "key" (virtual API key).
+	// Missing value -> priority order fallback.
+	HashOn string `yaml:"hash_on"`
 }
 
 // AffinityConfig extends prompt-cache affinity: pin key source (header value
@@ -272,6 +276,12 @@ func (c *Config) Validate() error {
 		if r.Strategy != "" && !validStrategy(r.Strategy) {
 			return fmt.Errorf("route %q has unknown strategy %q", r.Model, r.Strategy)
 		}
+		if r.HashOn != "" && r.HashOn != "key" && !strings.HasPrefix(r.HashOn, "header:") {
+			return fmt.Errorf("route %q has invalid hash_on %q (want \"key\" or \"header:Name\")", r.Model, r.HashOn)
+		}
+		if r.Strategy == "consistent_hash" && r.HashOn == "" {
+			return fmt.Errorf("route %q uses consistent_hash without hash_on", r.Model)
+		}
 		for _, cand := range r.Candidates {
 			if !seen[cand.Provider] {
 				return fmt.Errorf("route %q references unknown provider %q", r.Model, cand.Provider)
@@ -308,7 +318,8 @@ func (c *Config) Validate() error {
 func validStrategy(s string) bool {
 	switch s {
 	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion",
-		"p2c", "reset_aware", "fill_first", "auto", "lowest_usage":
+		"p2c", "reset_aware", "fill_first", "auto", "lowest_usage", "peak_ewma", "least_connections",
+		"consistent_hash":
 		return true
 	}
 	return false

@@ -192,6 +192,7 @@ curl -N localhost:8400/v1/chat/completions \
 | `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
 | `headroom`     | Fewest requests in the last 60s first; ties -> priority | Load-aware spreading |
 | `least_connections` | Fewest live in-flight upstream requests first, scored (inflight+1)/weight; ties -> priority | Long-running SSE streams; true live load (Kong) |
+| `consistent_hash` | Stateless ring: candidates sorted lexically, start at fnv32(value)%len, walk forward; needs `hash_on` | Sticky sessions without cache state (Kong) |
 | `lowest_usage` | Fewest observed tokens in the current minute first; unseen first, ties -> priority | Token-budget-aware spreading |
 
 Latency EWMA now decays lazily with a 10s time constant (Kong
@@ -247,6 +248,16 @@ must be a subset of the candidate's tags, `!tag` excludes candidates
 carrying it, `&tag` requires it. Empty candidate tags match everything
 except `&` requirements; no header = all candidates pass. The header is
 gateway-local (never forwarded upstream).
+
+## Consistent hashing
+
+`strategy: consistent_hash` with `hash_on: "header:X-Session-Id"` (any
+header) or `hash_on: "key"` (the virtual API key) maps each request value to
+a candidate deterministically — zero state, survives restarts. The ring is
+the route's candidates sorted lexically by (provider, model); the request
+starts at `fnv32(value) % len` and walks forward, skipping circuit-open or
+locked candidates. Missing hash value falls back to priority order. Affinity
+pins (when configured) still pre-empt strategies as before.
 
 ## Upstream quota observations
 
