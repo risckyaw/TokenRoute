@@ -173,6 +173,11 @@ type Config struct {
 	// RetryPolicy overrides failover/disable classification (new-api port).
 	// Unset = current hardcoded behavior exactly.
 	RetryPolicy *RetryPolicyConfig `yaml:"retry_policy"`
+	// GroupRatio (new-api group_ratio port): group name -> cost multiplier.
+	// Effective multiplier = route.multiplier × product of ratios for groups
+	// in key∩candidate intersection; empty intersection = 1.0. Unset =
+	// current behavior. Cost-only; routing/filtering unaffected.
+	GroupRatio map[string]float64 `yaml:"group_ratio"`
 }
 
 // RetryPolicyConfig (new-api status_code_ranges + AutomaticDisableKeywords):

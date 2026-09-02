@@ -50,6 +50,8 @@ type serverState struct {
 	providerTypes map[string]string
 	// retryPolicy: configured failover/disable overrides (nil = built-in).
 	retryPolicy *router.RetryPolicy
+	// groupRatio: group name -> cost multiplier (nil = unset).
+	groupRatio map[string]float64
 	maxBodyMB    int
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -235,7 +237,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			return nil, fmt.Errorf("retry_policy: %w", err)
 		}
 	}
-	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, retryPolicy: rp, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, retryPolicy: rp, groupRatio: cfg.GroupRatio, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 
 // healthTargets resolves per-provider probe targets: a provider's own
@@ -374,6 +376,7 @@ func main() {
 			StreamIdleMs:   st.streamIdleMs,
 			ProviderTypes:  st.providerTypes,
 			RetryPolicy:    st.retryPolicy,
+			GroupRatio:     st.groupRatio,
 			MaxBodyMB:      st.maxBodyMB,
 			SearchBackends: st.searchBackends,
 		}).ServeHTTP(w, r)

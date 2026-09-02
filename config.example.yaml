@@ -290,6 +290,14 @@ routes:
 # substrings classifying a retryable failure as auth/quota: keywords
 # containing balance/credit/quota/insufficient become quota_exhausted (15min
 # model lock), others auth.
+# Group ratio (new-api group_ratio port): cost multiplier per group name.
+# Effective multiplier = route.multiplier × product of ratios for groups in
+# the key∩candidate intersection (a key in ["vip"] hitting a candidate in
+# ["vip","us"] gets the "vip" ratio; multiple matches multiply all).
+# Empty intersection = 1.0. Cost-only (usage log + X-TokenRoute-Cost-USD);
+# routing/filtering unaffected. Unset = current behavior.
+#group_ratio: {vip: 1.0, free: 1.2}
+
 #retry_policy:
 #  retry_status_ranges: "100-199,300-399,401-407,409-499,500-503,505-599"
 #  never_retry: [504, 524]

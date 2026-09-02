@@ -62,6 +62,9 @@ type Options struct {
 	ProviderTypes map[string]string
 	// RetryPolicy overrides failover/disable classification; nil = built-in.
 	RetryPolicy *router.RetryPolicy
+	// GroupRatio: group name -> cost multiplier (new-api group_ratio port);
+	// nil = cost unaffected by groups.
+	GroupRatio map[string]float64
 	// MaxBodyMB caps request bodies (0 = default 10MB).
 	MaxBodyMB int
 	// SearchBackends enables POST /v1/search when non-empty.
@@ -77,6 +80,7 @@ func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
 		streamIdleMs: o.StreamIdleMs, providerTypes: o.ProviderTypes, retryPolicy: o.RetryPolicy,
+		groupRatio: o.GroupRatio,
 		maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
 	mux := chi.NewRouter()
 	mux.Use(correlationID)
@@ -150,6 +154,8 @@ type srv struct {
 	providerTypes map[string]string
 	// retryPolicy: configured failover/disable overrides (nil = built-in).
 	retryPolicy *router.RetryPolicy
+	// groupRatio: group name -> cost multiplier (nil = unset).
+	groupRatio map[string]float64
 	maxBody      int64
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -497,6 +503,29 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 		}
 	}
 	return body, model, k, candidates, strategy, mult, true
+}
+
+// groupRatioMultiplier multiplies the configured ratios of the groups
+// present in both lists (no intersection = 1.0).
+func groupRatioMultiplier(ratios map[string]float64, keyGroups, candGroups []string) float64 {
+	m := 1.0
+	for _, g := range keyGroups {
+		for _, cg := range candGroups {
+			if g == cg {
+				if r, ok := ratios[g]; ok {
+					m *= r
+				}
+			}
+		}
+	}
+	return m
+}
+
+func keyGroups(k *auth.Key) []string {
+	if k == nil {
+		return nil
+	}
+	return k.Groups
 }
 
 // groupsIntersect reports whether any group appears in both lists
@@ -865,6 +894,11 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if entry.CostUSD != nil && mult != 1 {
 		*entry.CostUSD *= mult
 	}
+	if entry.CostUSD != nil && s.groupRatio != nil {
+		// Group ratio (new-api group_ratio): multiply by the ratios of the
+		// key∩candidate group intersection (empty intersection = 1.0).
+		*entry.CostUSD *= groupRatioMultiplier(s.groupRatio, keyGroups(k), cand.Groups)
+	}
 	if hasBudget && entry.CostUSD != nil && *entry.CostUSD > budget {
 		entry.BudgetExceeded = true
 	}
@@ -950,6 +984,9 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	if entry.CostUSD != nil && mult != 1 {
 		*entry.CostUSD *= mult
+	}
+	if entry.CostUSD != nil && s.groupRatio != nil {
+		*entry.CostUSD *= groupRatioMultiplier(s.groupRatio, keyGroups(k), cand.Groups)
 	}
 	if k != nil && entry.TotalTokens > 0 {
 		if s.limiter != nil {

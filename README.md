@@ -128,6 +128,10 @@ speak one API.
 - **Group-based access** — keys and route candidates carry `groups`; a key only
   reaches candidates sharing a group (empty side = wildcard, else 403
   `group_forbidden`).
+- **Group ratio** — `group_ratio: {vip: 1.0, free: 1.2}` multiplies request
+  cost by the ratios of the key∩candidate group intersection (product when
+  several match; empty intersection = 1.0); cost-only, routing unaffected
+  (new-api group_ratio port).
 - **Model mapping** — per-provider `model_mapping` rewrites route models to
   upstream aliases; decision header and usage log record the final model.
 - **Request overrides** — per-provider `param_override` / `param_delete` /
@@ -245,6 +249,7 @@ gateway-local (never forwarded upstream).
 | `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |
 | `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
 | `retry_policy` | Optional `{retry_status_ranges, never_retry, disable_status_ranges, disable_keywords}` failover/disable overrides (unset = built-in) |
+| `group_ratio` | Optional map group → cost multiplier; applied on key∩candidate group intersection, cost-only |
 
 Provider types:
 
