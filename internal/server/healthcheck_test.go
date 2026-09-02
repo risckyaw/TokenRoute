@@ -46,8 +46,11 @@ func TestHealthCheck_FeedsRouterNoUsageRows(t *testing.T) {
 	if calls.Load() < 2 {
 		t.Fatalf("expected >=2 probes, got %d", calls.Load())
 	}
-	if rt.LatencyMs("p1") == 0 {
-		t.Fatal("latency EMA must be fed by probes")
+	// Probes feed the same RecordResultKind path as user traffic: a failing
+	// probe series opens the circuit (covered by TestHealthCheck_FailureFeedsCircuit);
+	// here the window counter proves results were recorded.
+	if got := rt.WindowReqs("p1"); got < 2 {
+		t.Fatalf("window reqs = %d, want >=2 (RecordResultKind not fed)", got)
 	}
 	if _, _, known := rt.Quota().Remaining("p1", "m1"); known {
 		t.Fatal("health checks must not seed/track the quota ledger")

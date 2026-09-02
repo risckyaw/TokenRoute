@@ -647,6 +647,17 @@ func (r *Router) LatencyMs(providerName string) float64 {
 	return r.latency[providerName]
 }
 
+// WindowReqs returns the provider's request count in the current 60s window
+// (0 if unseen) — headroom/lowest_usage signal, exposed for tests.
+func (r *Router) WindowReqs(providerName string) int {
+	r.latMu.Lock()
+	defer r.latMu.Unlock()
+	if w := r.windows[providerName]; w != nil {
+		return w.reqs
+	}
+	return 0
+}
+
 // Resolve returns the route for an exact match, else nil.
 func (r *Router) Resolve(model string) *Route {
 	for _, rt := range r.routes {
