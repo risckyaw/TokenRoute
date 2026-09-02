@@ -109,6 +109,10 @@ type RouteConfig struct {
 	// "header:X-Session-Id" (any header name) or "key" (virtual API key).
 	// Missing value -> priority order fallback.
 	HashOn string `yaml:"hash_on"`
+	// Sticky (round_robin only, 9router stickyLimit): keep N consecutive
+	// requests on the same candidate before rotating. Default 1 = rotate every
+	// request. Ignored by other strategies.
+	Sticky int `yaml:"sticky"`
 }
 
 // AffinityConfig extends prompt-cache affinity: pin key source (header value
@@ -281,6 +285,12 @@ func (c *Config) Validate() error {
 		}
 		if r.Strategy == "consistent_hash" && r.HashOn == "" {
 			return fmt.Errorf("route %q uses consistent_hash without hash_on", r.Model)
+		}
+		if r.Sticky < 0 {
+			return fmt.Errorf("route %q has negative sticky", r.Model)
+		}
+		if r.Sticky > 1 && r.Strategy != "round_robin" {
+			return fmt.Errorf("route %q sets sticky with strategy %q (round_robin only)", r.Model, r.Strategy)
 		}
 		for _, cand := range r.Candidates {
 			if !seen[cand.Provider] {

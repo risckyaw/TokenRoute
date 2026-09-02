@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -115,4 +116,34 @@ func splitLines(s string) []string {
 		out = append(out, cur)
 	}
 	return out
+}
+
+// sticky is round_robin-only and must be non-negative.
+func TestStickyConfig(t *testing.T) {
+	tmpl := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: auto
+    strategy: %s
+    sticky: %d
+    candidates:
+      - provider: p1
+        model: up
+`
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "round_robin", 5))); err != nil {
+		t.Fatalf("valid sticky rejected: %v", err)
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "priority", 5))); err == nil {
+		t.Fatal("sticky with a non-round_robin strategy must fail load")
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "round_robin", -1))); err == nil {
+		t.Fatal("negative sticky must fail load")
+	}
+	// sticky: 1 on any strategy is the default and stays legal.
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "priority", 1))); err != nil {
+		t.Fatalf("sticky 1 rejected: %v", err)
+	}
 }

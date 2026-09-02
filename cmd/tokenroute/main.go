@@ -124,7 +124,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	routes := make([]*router.Route, 0, len(cfg.Routes))
 	for _, rc := range cfg.Routes {
 		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier, FallbackRoutes: rc.FallbackRoutes,
-			PromptCacheAffinity: rc.PromptCacheAffinity, HashOn: rc.HashOn}
+			PromptCacheAffinity: rc.PromptCacheAffinity, HashOn: rc.HashOn, Sticky: rc.Sticky}
 		if rc.Affinity != nil && rc.Affinity.Enabled {
 			rt.PromptCacheAffinity = true
 			rt.AffinityKeyHeader = rc.Affinity.KeyHeader

@@ -186,7 +186,7 @@ curl -N localhost:8400/v1/chat/completions \
 | Strategy       | Behavior                                             | When to use |
 |----------------|------------------------------------------------------|-------------|
 | `priority`     | First candidate by provider priority (default)       | Preferred provider with fallback |
-| `round_robin`  | Rotates the starting candidate each request          | Even spread across equivalent providers |
+| `round_robin`  | Rotates the starting candidate each request; `sticky: N` rotates only every N requests | Even spread across equivalent providers (sticky keeps prompt caches warm) |
 | `least_latency`| Lowest decayed-EWMA latency first; unseen providers seed with the mean of known latencies (slow-start, Kong-style) | Latency-sensitive traffic |
 | `peak_ewma`    | Draws 2 random candidates, lower decayed-ewma/weight score first; rest priority order | Latency+weight balancing without global sorts |
 | `weighted`     | Weighted-random first pick (weight default 1); rest stay in priority order | Gradual traffic shifts / canary |
@@ -270,6 +270,18 @@ gateway records the observed remaining-token budget and reset time. For 60s
 the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
+
+## Sticky round-robin
+
+`strategy: round_robin` with `sticky: N` (9router `getRotatedModels`) advances
+the rotation only after N consecutive requests instead of every request, so a
+provider's prompt cache is not invalidated by a rotation on the very next call.
+The cursor walks the route's **original** candidate list, so circuit-open,
+locked, or tag-filtered candidates are skipped forward in order without
+shifting the cycle; a cursor past every survivor wraps to the first. `sticky: 1`
+(the default) is the legacy per-request rotation, and `sticky` on any other
+strategy fails config load. State is per-route and in-memory: a SIGHUP reload
+rebuilds routes, resetting the cursor.
 
 ## Earliest Retry-After on terminal 429
 

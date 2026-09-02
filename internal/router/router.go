@@ -95,11 +95,42 @@ type Route struct {
 	// Rationale (new-api SkipRetryOnFailure): the pinned channel holds
 	// per-session state; retrying elsewhere loses it and double-bills.
 	AffinitySkipRetry bool
+	// Sticky (round_robin only, 9router getRotatedModels stickyLimit): advance
+	// the rotation only after N consecutive dispatches on the same candidate.
+	// 1/0 = rotate every request (default). Larger values keep consecutive
+	// requests on one provider so its prompt cache stays warm.
+	Sticky int
 
 	rr       atomic.Uint64 // round-robin counter
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)
-	mu       sync.Mutex    // guards rand source for weighted
+	mu       sync.Mutex    // guards randSrc (weighted/p2c) and sticky state
 	randSrc  *rand.Rand
+	// sticky state (guarded by mu): index into Candidates and how many
+	// consecutive dispatches it has served. Reset by config reload, which
+	// rebuilds Route values from scratch.
+	stickyIdx   int
+	stickyCount int
+}
+
+// stickyNext returns the current sticky index into Candidates and advances it
+// after Sticky consecutive dispatches (wrapping).
+func (rt *Route) stickyNext() int {
+	n := rt.Sticky
+	if n < 1 {
+		n = 1
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	idx := rt.stickyIdx
+	rt.stickyCount++
+	if rt.stickyCount >= n {
+		rt.stickyCount = 0
+		rt.stickyIdx++
+		if len(rt.Candidates) > 0 {
+			rt.stickyIdx %= len(rt.Candidates)
+		}
+	}
+	return idx
 }
 
 // window is a 60s tumbling counter used by the headroom strategy.
@@ -371,12 +402,16 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 // Empty = no ring rotation (priority order).
 func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue string) []Candidate {
 	allowed := make([]Candidate, 0, len(rt.Candidates))
-	for _, c := range rt.Candidates {
+	// origIdx[i] is allowed[i]'s position in rt.Candidates — sticky round-robin
+	// rotates on the ORIGINAL list so filtering does not shift the cursor.
+	origIdx := make([]int, 0, len(rt.Candidates))
+	for i, c := range rt.Candidates {
 		if !sel.MatchTags(c.Tags) {
 			continue
 		}
 		if r.circuitAllow(c.Provider.Name()) && !r.IsModelLocked(c.Provider.Name(), c.Model) {
 			allowed = append(allowed, c)
+			origIdx = append(origIdx, i)
 		}
 	}
 	if rt.Strategy == StrategyLKGP {
@@ -396,7 +431,24 @@ func (r *Router) OrderCandidatesHash(rt *Route, sel *TagSelector, hashValue stri
 	switch rt.Strategy {
 	case StrategyRoundRobin:
 		if len(allowed) > 1 {
-			start := int(rt.rr.Add(1)-1) % len(allowed)
+			start := 0
+			if rt.Sticky > 1 {
+				// Sticky rotation (9router stickyLimit): the cursor walks the
+				// ORIGINAL candidate list and advances only every N requests;
+				// filtered-out candidates are skipped forward in order, so a
+				// circuit-open pick lands on the next surviving candidate
+				// instead of shifting the whole cycle. No survivor at or after
+				// the cursor wraps to the first survivor.
+				want := rt.stickyNext()
+				for i, oi := range origIdx {
+					if oi >= want {
+						start = i
+						break
+					}
+				}
+			} else {
+				start = int(rt.rr.Add(1)-1) % len(allowed)
+			}
 			rotated := append([]Candidate(nil), allowed[start:]...)
 			allowed = append(rotated, allowed[:start]...)
 		}

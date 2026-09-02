@@ -191,6 +191,12 @@ routes:
 
   - model: balanced
     strategy: round_robin           # rotate starting candidate each request
+    # sticky: N (round_robin only, 9router stickyLimit) keeps N consecutive
+    # requests on the same candidate before rotating — provider-side prompt
+    # caches stay warm instead of being invalidated every request. Default 1
+    # (rotate every request). The cursor walks the ORIGINAL candidate list, so
+    # circuit-open/locked candidates are skipped in order without shifting it.
+    #sticky: 8
     candidates:
       - provider: deepseek
         model: deepseek-chat
