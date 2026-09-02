@@ -127,6 +127,11 @@ speak one API.
   `group_forbidden`).
 - **Model mapping** — per-provider `model_mapping` rewrites route models to
   upstream aliases; decision header and usage log record the final model.
+- **Request overrides** — per-provider `param_override` / `param_delete` /
+  `header_override` / `header_pass` (globs, case-insensitive, resurrecting
+  blocklisted client headers) and per-candidate `param_override` applied
+  after the provider's (candidate wins). Set-only; JSON object bodies only,
+  non-objects pass through untouched (new-api override port, reduced).
 - **Upstream hardening** — `response_header_timeout_ms` bounds the wait for
   upstream headers without cutting streams; `stream_idle_timeout_ms` cuts SSE
   streams that go silent.

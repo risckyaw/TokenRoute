@@ -48,6 +48,9 @@ type Candidate struct {
 	Weight   int      // used by the weighted strategy; defaults to 1
 	Groups   []string // empty = usable by every key group
 	Tags     []string // tag-routing labels; empty = matches all plain/! selectors
+	// ParamOverride: candidate-level set-only body overrides (applied after
+	// provider-level ops; wins on key conflict).
+	ParamOverride map[string]any
 }
 
 type Route struct {
@@ -95,6 +98,32 @@ type Router struct {
 	quota     *QuotaLedger         // pre-request budget awareness (nil-safe)
 	aliases   map[string]string    // client model name -> virtual route model
 	affinity  *AffinityCache       // prompt-prefix pinning (nil = disabled)
+	// overrides: provider name -> set-only body/header ops (new-api port).
+	overrides map[string]ProviderOverride
+}
+
+// ProviderOverride carries a provider's set-only request mutations.
+type ProviderOverride struct {
+	ParamSet  map[string]any
+	ParamDel  []string
+	HeaderSet map[string]string
+	HeaderPass []string // client header globs forwarded upstream
+}
+
+// SetProviderOverride installs a provider's request overrides (empty = no-op).
+func (r *Router) SetProviderOverride(name string, o ProviderOverride) {
+	if r.overrides == nil {
+		r.overrides = map[string]ProviderOverride{}
+	}
+	r.overrides[name] = o
+}
+
+// ProviderOverride returns a provider's overrides (zero value when none).
+func (r *Router) ProviderOverride(name string) ProviderOverride {
+	if o, ok := r.overrides[name]; ok {
+		return o
+	}
+	return ProviderOverride{}
 }
 
 // SetAffinity enables prompt-cache affinity pinning (nil disables).

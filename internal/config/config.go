@@ -67,6 +67,15 @@ type ProviderConfig struct {
 	// chat through the normal provider path); results feed circuit/EMA only,
 	// never the quota ledger or usage log.
 	HealthCheck *HealthCheckConfig `yaml:"health_check"`
+	// ParamOverride/ParamDelete/HeaderOverride/HeaderPass (severely reduced
+	// new-api override port): set-only JSON body ops applied after model
+	// rewrite (candidate-level param_override wins on key conflict);
+	// header_override sets upstream request headers; header_pass forwards
+	// client headers (glob, case-insensitive) bypassing filterHeaders.
+	ParamOverride  map[string]any   `yaml:"param_override"`
+	ParamDelete    []string         `yaml:"param_delete"`
+	HeaderOverride map[string]string `yaml:"header_override"`
+	HeaderPass     []string         `yaml:"header_pass"`
 }
 
 type CandidateConfig struct {
@@ -75,6 +84,9 @@ type CandidateConfig struct {
 	Weight   int      `yaml:"weight"` // weighted strategy; default 1
 	Groups   []string `yaml:"groups"` // empty = all key groups allowed
 	Tags     []string `yaml:"tags"`   // tag-routing labels (X-Route-Tags header); empty = matches all
+	// ParamOverride is applied after the provider-level param ops and wins
+	// on key conflict (set-only).
+	ParamOverride map[string]any `yaml:"param_override"`
 }
 
 type RouteConfig struct {

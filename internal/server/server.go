@@ -537,6 +537,12 @@ func (s *srv) failover(ctx context.Context, hdr http.Header, body []byte, candid
 // guard (0 = skip the guard). Candidates whose priced context window is
 // smaller than the estimate are skipped without an upstream call.
 func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, candidates []router.Candidate, call callFn, estTokens int) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
+	return s.failoverPass(ctx, hdr, nil, body, candidates, call, estTokens)
+}
+
+// failoverPass is failoverCtx plus the blocked client headers (for
+// per-provider header_pass globs); nil blocked = plain filtering.
+func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body []byte, candidates []router.Candidate, call callFn, estTokens int) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int) {
 	for _, c := range candidates {
 		cand = c
 		// Model mapping: alias -> upstream model, per provider, applied after
@@ -549,8 +555,27 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 				continue
 			}
 		}
+		// Per-candidate request overrides (new-api port): provider-level
+		// param/header ops, then candidate-level param sets (candidate wins).
+		ovr := s.router.ProviderOverride(c.Provider.Name())
+		reqBody, reqHdr := body, hdr
+		if ovr.ParamSet != nil || ovr.ParamDel != nil || cand.ParamOverride != nil {
+			reqBody = ParamOps(body, ovr.ParamSet, ovr.ParamDel, cand.ParamOverride)
+		}
+		if ovr.HeaderSet != nil || (blocked != nil && len(ovr.HeaderPass) > 0) {
+			reqHdr = hdr.Clone()
+			// header_pass: resurrect blocked client headers matching the globs.
+			for k, vs := range blocked {
+				if HeaderPassMatch(ovr.HeaderPass, k) {
+					reqHdr[k] = append([]string(nil), vs...)
+				}
+			}
+			for k, v := range ovr.HeaderSet {
+				reqHdr.Set(k, v)
+			}
+		}
 		attemptStart := time.Now()
-		req := &provider.Request{Model: cand.Model, Body: body, Header: hdr}
+		req := &provider.Request{Model: cand.Model, Body: reqBody, Header: reqHdr}
 		att, err := call(ctx, c.Provider, req)
 		attempts++
 		if err != nil {
@@ -631,7 +656,7 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 // (LiteLLM fallbacks): other virtual models tried in order, max 3 route
 // hops, cycles skipped via the visited set. Client errors (4xx relayed
 // as-is) never trigger fallback — failoverCtx returns those as resp != nil.
-func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, affinityHit bool) {
+func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, affinityHit bool) {
 	sel := router.ParseTagSelector(tagHeader)
 	visited := map[string]bool{model: true}
 	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
@@ -651,7 +676,7 @@ func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model 
 			cand, resp, lfr, le, at = s.fusionRun(ctx, hdr, body, candidates[:2])
 			fused = true
 		} else {
-			cand, resp, lfr, le, at = s.failoverCtx(ctx, hdr, body, candidates, chatCall, estTokens)
+			cand, resp, lfr, le, at = s.failoverPass(ctx, hdr, blocked, body, candidates, chatCall, estTokens)
 		}
 		attempts += at
 		if lfr != nil {
@@ -758,7 +783,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	hdr := filterHeaders(r.Header)
+	hdr, blocked := filterHeadersBlocked(r.Header)
 
 	// Response cache: non-stream only; key uses the first candidate's
 	// upstream model so a routing change misses instead of cross-serving.
@@ -799,7 +824,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	fused := false
 	est := estimateChatTokens(body)
 	var affinityHit bool
-	cand, resp, lastFailResp, lastErr, attempts, fused, affinityHit = s.runRoute(r.Context(), hdr, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
+	cand, resp, lastFailResp, lastErr, attempts, fused, affinityHit = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
 	setDecisionHeader(w, cand, strategy, attempts)
 	if affinityHit {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";affinity=hit")
@@ -894,7 +919,8 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	cand, resp, lastFailResp, lastErr, attempts := s.failoverCtx(r.Context(), filterHeaders(r.Header), body, candidates, embedCall, estimateEmbedTokens(body))
+	ehdr, eblocked := filterHeadersBlocked(r.Header)
+	cand, resp, lastFailResp, lastErr, attempts := s.failoverPass(r.Context(), ehdr, eblocked, body, candidates, embedCall, estimateEmbedTokens(body))
 	setDecisionHeader(w, cand, strategy, attempts)
 	if resp == nil && lastFailResp == nil && errors.Is(lastErr, errContextExceeded) {
 		writeErr(w, http.StatusBadRequest, errContextExceeded.Error(), "context_length_exceeded")
@@ -1201,18 +1227,26 @@ func (s *srv) relayStream(w http.ResponseWriter, resp *http.Response, entry *usa
 
 // filterHeaders drops hop-by-hop and auth headers from the client request.
 func filterHeaders(h http.Header) http.Header {
-	out := http.Header{}
+	out, _ := filterHeadersBlocked(h)
+	return out
+}
+
+// filterHeadersBlocked is filterHeaders plus the dropped entries (for
+// per-provider header_pass globs, which may resurrect blocked headers).
+func filterHeadersBlocked(h http.Header) (passed, blocked http.Header) {
+	passed, blocked = http.Header{}, http.Header{}
 	for k, vs := range h {
 		switch http.CanonicalHeaderKey(k) {
 		case "Authorization", "Content-Length", "Content-Type", "Connection",
 			"Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te",
 			"Trailer", "Transfer-Encoding", "Upgrade", "Host",
 			"X-Timeout-Ms", "X-Max-Cost-Usd", "X-Route-Tags": // gateway-local controls
+			blocked[k] = append([]string(nil), vs...)
 			continue
 		}
-		out[k] = append([]string(nil), vs...)
+		passed[k] = append([]string(nil), vs...)
 	}
-	return out
+	return passed, blocked
 }
 
 type modelEntry struct {

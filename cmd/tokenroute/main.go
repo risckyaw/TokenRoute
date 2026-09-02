@@ -125,11 +125,12 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			PromptCacheAffinity: rc.PromptCacheAffinity}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
-				Provider: byName[cc.Provider],
-				Model:    cc.Model,
-				Weight:   cc.Weight,
-				Groups:   cc.Groups,
-				Tags:     cc.Tags,
+				Provider:      byName[cc.Provider],
+				Model:         cc.Model,
+				Weight:        cc.Weight,
+				Groups:        cc.Groups,
+				Tags:          cc.Tags,
+				ParamOverride: cc.ParamOverride,
 			})
 		}
 		routes = append(routes, rt)
@@ -164,6 +165,14 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	}
 	for name, m := range mappings {
 		rt.SetModelMapping(name, m)
+	}
+	for _, pc := range cfg.Providers {
+		if pc.ParamOverride != nil || pc.ParamDelete != nil || pc.HeaderOverride != nil || pc.HeaderPass != nil {
+			rt.SetProviderOverride(pc.Name, router.ProviderOverride{
+				ParamSet: pc.ParamOverride, ParamDel: pc.ParamDelete,
+				HeaderSet: pc.HeaderOverride, HeaderPass: pc.HeaderPass,
+			})
+		}
 	}
 	for _, pc := range cfg.Providers {
 		if pc.Circuit != nil {

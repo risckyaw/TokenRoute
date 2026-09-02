@@ -67,6 +67,16 @@ providers:
     # Per-provider model aliases: client/route model -> actual upstream model.
     #model_mapping:
     #  gpt-4o: deepseek-chat
+    # Request overrides (severely-reduced new-api override port; all set-only,
+    # no expressions/conditions). param_override sets JSON body keys after the
+    # model rewrite (candidate-level param_override wins on conflict);
+    # param_delete removes keys; header_override sets headers on the upstream
+    # request; header_pass forwards client headers matching the globs
+    # (case-insensitive) even when the gateway blocklist would drop them.
+    #param_override: {max_tokens: 4096, temperature: 1.0}
+    #param_delete: ["top_k"]
+    #header_override: {"X-Title": "tokenroute"}
+    #header_pass: ["X-Custom-*"]
 
   - name: deepseek
     type: openai                    # openai-compatible API
@@ -148,6 +158,9 @@ routes:
         # must be a subset of the candidate's tags; empty candidate tags match
         # everything except &requirements.
         #tags: [vision, us]
+        # Candidate-level body overrides, applied AFTER the provider's
+        # param_override/param_delete and winning on key conflict.
+        #param_override: {max_tokens: 8192}
       - provider: openai
         model: gpt-4o-mini
 
