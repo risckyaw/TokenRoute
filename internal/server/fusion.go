@@ -36,6 +36,9 @@ func (s *srv) fusionRun(ctx context.Context, hdr http.Header, body []byte, pair 
 			attemptStart := time.Now()
 			req := &provider.Request{Model: c.Model, Body: body, Header: hdr}
 			att, err := c.Provider.ChatComplete(ctx, req)
+			if err == nil {
+				s.observeUpstreamQuota(c.Provider.Name(), c.Model, att.Header)
+			}
 			switch {
 			case err != nil:
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)

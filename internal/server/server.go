@@ -610,6 +610,9 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 			}
 			continue
 		}
+		// Feed upstream-signalled quota state into the ledger (success and
+		// error responses alike; stream headers are available pre-body).
+		s.observeUpstreamQuota(c.Provider.Name(), cand.Model, att.Header)
 		if s.retryableStatus(att.StatusCode) {
 			errBody, _ := io.ReadAll(io.LimitReader(att.Body, 64<<10))
 			att.Body.Close()
@@ -1118,6 +1121,60 @@ func rateLimitReset(h http.Header) time.Duration {
 		if d > 0 {
 			return d
 		}
+	}
+	return 0
+}
+
+// observeUpstreamQuota parses the upstream's rate-limit headers (Kong
+// response-ratelimiting port) and feeds the quota ledger. Covers
+// x-ratelimit-remaining-tokens / x-ratelimit-reset-tokens ([OI], DeepSeek)
+// and the anthropic-ratelimit-* prefixed variants. Missing/invalid = no-op.
+func (s *srv) observeUpstreamQuota(providerName, model string, h http.Header) {
+	rem, okRem := headerInt(h, "X-Ratelimit-Remaining-Tokens")
+	if !okRem {
+		rem, okRem = headerInt(h, "Anthropic-Ratelimit-Remaining-Tokens")
+	}
+	if !okRem {
+		return // token-remaining is the signal we track; requests-only = no observation
+	}
+	var reset time.Duration
+	for _, name := range []string{"X-Ratelimit-Reset-Tokens", "Anthropic-Ratelimit-Reset-Tokens"} {
+		if d := parseOIDuration(h.Get(name)); d > 0 {
+			reset = d
+			break
+		}
+	}
+	s.router.Quota().ObserveUpstream(providerName, model, rem, reset)
+}
+
+// headerInt parses a single integer header value.
+func headerInt(h http.Header, name string) (int64, bool) {
+	v := strings.TrimSpace(h.Get(name))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseOIDuration parses [OI] duration strings ("1s", "1m30s", "6h") or
+// plain integer seconds; garbage/non-positive -> 0.
+func parseOIDuration(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
 	}
 	return 0
 }

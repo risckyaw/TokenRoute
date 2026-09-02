@@ -238,6 +238,16 @@ carrying it, `&tag` requires it. Empty candidate tags match everything
 except `&` requirements; no header = all candidates pass. The header is
 gateway-local (never forwarded upstream).
 
+## Upstream quota observations
+
+Providers that return rate-limit headers (`x-ratelimit-remaining-tokens`,
+`x-ratelimit-reset-tokens`; Anthropic's `anthropic-ratelimit-*` variants too)
+feed the quota ledger automatically: after every upstream response the
+gateway records the observed remaining-token budget and reset time. For 60s
+the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
+provider-signalled state over local accounting (Kong response-ratelimiting
+style). Missing or invalid headers are ignored — zero config, zero cost.
+
 ## Configuration
 
 `config.yaml` — secrets only via `${ENV_VAR}` placeholders:

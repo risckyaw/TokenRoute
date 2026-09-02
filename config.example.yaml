@@ -126,6 +126,9 @@ routes:
   #              with free_tier: maximize one free tier before the next).
   # auto:        composite score = health × latency × cost × quota headroom
   #              (a single zero factor disqualifies; OmniRoute port).
+  # Quota-aware strategies (reset_aware/fill_first/auto) prefer upstream
+  # x-ratelimit-remaining-tokens / reset-tokens headers when fresh (<60s);
+  # no config needed — observations are automatic per response.
   # Failover: retryable statuses (429/500/502/503/504) and transport errors
   # fall through to the next candidate; other statuses are relayed as-is.
   # A 429 whose body signals exhausted balance ("insufficient balance",
