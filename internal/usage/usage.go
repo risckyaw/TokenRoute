@@ -106,6 +106,20 @@ func OpenDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open usage db: %w", err)
 	}
+	// Concurrent writers (fusion panel calls log a row each, in parallel) hit
+	// SQLITE_BUSY and silently lose usage rows. One connection serializes them
+	// through the pool instead; WAL (persisted in the file) keeps readers from
+	// blocking, and busy_timeout covers the other handle sharing this DB.
+	// ponytail: a single connection means a slow query delays writes. Every
+	// query here is a bounded LIMIT/aggregate, so that is fine; move to a
+	// per-connection DSN pragma + a write mutex if reads ever get heavy.
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{"PRAGMA busy_timeout = 5000", "PRAGMA journal_mode = WAL"} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("usage db %s: %w", pragma, err)
+		}
+	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS usage_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		request_id TEXT,

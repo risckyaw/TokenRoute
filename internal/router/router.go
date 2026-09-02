@@ -32,6 +32,7 @@ const (
 	StrategyPeakEWMA     = "peak_ewma"   // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
 	StrategyLeastConn    = "least_connections" // fewest in-flight upstream requests first (Kong)
 	StrategyConsistentHash = "consistent_hash" // stateless ring on a request value (Kong)
+	StrategyFusionJudge    = "fusion_judge"    // panel fan-out + one judge model synthesizes
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -40,7 +41,7 @@ func ValidStrategy(s string) bool {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
 		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
 		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage,
-		StrategyPeakEWMA, StrategyLeastConn, StrategyConsistentHash:
+		StrategyPeakEWMA, StrategyLeastConn, StrategyConsistentHash, StrategyFusionJudge:
 		return true
 	}
 	return false
@@ -100,6 +101,10 @@ type Route struct {
 	// 1/0 = rotate every request (default). Larger values keep consecutive
 	// requests on one provider so its prompt cache stays warm.
 	Sticky int
+	// FusionJudge (fusion_judge strategy only): judge spec "provider/model"
+	// plus quorum/grace/timeout knobs. The server owns the semantics; the
+	// router only carries the values so the request path can read them.
+	FusionJudge FusionJudgeConfig
 
 	rr       atomic.Uint64 // round-robin counter
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)
@@ -131,6 +136,15 @@ func (rt *Route) stickyNext() int {
 		}
 	}
 	return idx
+}
+
+// FusionJudgeConfig carries the fusion_judge route knobs (semantics live in
+// the server, which runs the panel fan-out and the judge call).
+type FusionJudgeConfig struct {
+	Judge     string // "provider/model"; empty = first candidate
+	MinPanel  int    // answers to wait for before the grace window (default 2)
+	GraceMs   int    // straggler window after quorum (default 1500)
+	TimeoutMs int    // hard cap for the panel phase (default 60000)
 }
 
 // window is a 60s tumbling counter used by the headroom strategy.

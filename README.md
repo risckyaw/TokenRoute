@@ -196,6 +196,7 @@ curl -N localhost:8400/v1/chat/completions \
 | `least_connections` | Fewest live in-flight upstream requests first, scored (inflight+1)/weight; ties -> priority | Long-running SSE streams; true live load (Kong) |
 | `consistent_hash` | Stateless ring: candidates sorted lexically, start at fnv32(value)%len, walk forward; needs `hash_on` | Sticky sessions without cache state (Kong) |
 | `lowest_usage` | Fewest observed tokens in the current minute first; unseen first, ties -> priority | Token-budget-aware spreading |
+| `fusion_judge` | Fans the prompt to every candidate (the panel), then one judge model synthesizes their answers into the reply | Hardest questions, where cross-checking beats cost |
 
 Latency EWMA now decays lazily with a 10s time constant (Kong
 `balancer/latency.lua`): stale latency readings fade instead of pinning a
@@ -270,6 +271,45 @@ gateway records the observed remaining-token budget and reset time. For 60s
 the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
+
+## fusion_judge
+
+`strategy: fusion_judge` (9router `handleFusionChat`) answers one request with a
+panel plus a judge: every candidate of the route is asked in parallel, then a
+single judge model synthesizes their answers into the reply.
+
+```yaml
+- model: panel
+  strategy: fusion_judge
+  fusion_judge: {judge: "openai/gpt-4o", min_panel: 2, grace_ms: 1500, timeout_ms: 60000}
+  candidates:
+    - {provider: deepseek, model: deepseek-chat}
+    - {provider: openai,   model: gpt-4o-mini}
+    - {provider: anthropic, model: claude-sonnet-4-6}
+```
+
+- **Panel calls** are always non-stream, with `tools`/`tool_choice`/
+  `stream_options` stripped and tool/function history flattened to assistant
+  prose (`[Called tools: ...]`, `[Tool result: ...]`) so panel models that lack
+  tool support still parse the conversation.
+- **Collection** waits for `min_panel` answers (default 2, clamped to the panel
+  size), then allows `grace_ms` (default 1500) for stragglers; `timeout_ms`
+  (default 60000) hard-caps the phase and every panel call's context.
+- **Judge**: `judge: "provider/model"` (defaults to the first candidate) gets
+  the original body plus one appended user turn containing the panel answers,
+  anonymized as `Source 1..N`. Model names never appear in the prompt. The judge
+  honors the client's `stream` flag, so streaming clients stream the synthesis.
+- **Degradation**: exactly one answer is relayed directly — that model is
+  re-issued the *original* body (tools and stream intact), no synthesis; zero
+  answers relays the last upstream error, or 502 on transport failures, exactly
+  like the sequential all-fail path.
+- **Metering**: every panel call and the judge call get their own usage row with
+  real provider/model/tokens/cost, all sharing the request id. Circuit
+  breakers, quotas and the context guard apply as usual, so a circuit-open panel
+  member is simply absent from the fan-out. The decision header reports
+  `;fusion=judge;panel=N;answers=M`.
+
+Cost scales with the panel: N+1 billed completions per request.
 
 ## Per-failure cooldown rules
 

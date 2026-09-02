@@ -116,8 +116,8 @@ providers:
 routes:
   # Virtual model names clients use in "model" field.
   # strategy: priority (default) | round_robin | least_latency | weighted | cost |
-  #           lkgp | headroom | fusion | p2c | reset_aware | fill_first | auto |
-  #           lowest_usage
+  #           lkgp | headroom | fusion | fusion_judge | p2c | reset_aware |
+  #           fill_first | auto | lowest_usage
   # lowest_usage: fewest observed tokens in the current minute first (LiteLLM
   #              lowest_tpm_rpm_v2); unseen candidates first, ties by priority.
   # p2c:         power-of-2-choices — 2 random candidates, least-loaded first.
@@ -283,6 +283,24 @@ routes:
         model: deepseek-chat
       - provider: openai
         model: gpt-4o-mini
+
+  # fusion_judge (9router handleFusionChat): every candidate is a PANEL member
+  # asked in parallel (non-stream, tools stripped, tool history flattened to
+  # prose), then ONE judge model synthesizes their answers into the reply. The
+  # judge gets the original body plus an appended user turn with the answers
+  # anonymized as "Source 1..N"; it honors the client's stream flag. Waits for
+  # min_panel answers (default 2, clamped to the panel size), then grace_ms
+  # (default 1500) for stragglers, hard-capped by timeout_ms (default 60000).
+  # 1 answer -> relayed directly with the ORIGINAL body (no synthesis);
+  # 0 answers -> the last upstream error, or 502. EVERY panel call and the
+  # judge call are billed and logged separately — cost scales with the panel.
+  # judge defaults to the first candidate. Needs >= 2 candidates.
+  #- model: panel
+  #  strategy: fusion_judge
+  #  fusion_judge: {judge: "openai/gpt-4o", min_panel: 2, grace_ms: 1500, timeout_ms: 60000}
+  #  candidates:
+  #    - {provider: deepseek, model: deepseek-chat}
+  #    - {provider: openai, model: gpt-4o-mini}
 
 # Response cache (non-stream chat completions): identical requests within
 # ttl are served from memory with X-TokenRoute-Cache: HIT and zero cost.

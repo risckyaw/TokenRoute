@@ -113,6 +113,22 @@ type RouteConfig struct {
 	// requests on the same candidate before rotating. Default 1 = rotate every
 	// request. Ignored by other strategies.
 	Sticky int `yaml:"sticky"`
+	// FusionJudge (fusion_judge strategy only): panel fan-out + judge synthesis.
+	FusionJudge *FusionJudgeConfig `yaml:"fusion_judge"`
+}
+
+// FusionJudgeConfig tunes the fusion_judge strategy: the route's candidates are
+// the panel, and one judge model synthesizes their answers into the reply.
+type FusionJudgeConfig struct {
+	// Judge is "provider/model"; empty = the route's first candidate.
+	Judge string `yaml:"judge"`
+	// MinPanel is the answer quorum before the straggler grace starts
+	// (default 2, clamped to the panel size).
+	MinPanel int `yaml:"min_panel"`
+	// GraceMs is the straggler window after quorum (default 1500).
+	GraceMs int `yaml:"grace_ms"`
+	// TimeoutMs hard-caps the panel phase (default 60000).
+	TimeoutMs int `yaml:"timeout_ms"`
 }
 
 // AffinityConfig extends prompt-cache affinity: pin key source (header value
@@ -323,6 +339,26 @@ func (c *Config) Validate() error {
 		if r.Sticky > 1 && r.Strategy != "round_robin" {
 			return fmt.Errorf("route %q sets sticky with strategy %q (round_robin only)", r.Model, r.Strategy)
 		}
+		if r.FusionJudge != nil {
+			if r.Strategy != "fusion_judge" {
+				return fmt.Errorf("route %q sets fusion_judge with strategy %q", r.Model, r.Strategy)
+			}
+			if j := r.FusionJudge.Judge; j != "" {
+				name, model, ok := strings.Cut(j, "/")
+				if !ok || name == "" || model == "" {
+					return fmt.Errorf("route %q fusion_judge.judge %q must be \"provider/model\"", r.Model, j)
+				}
+				if !seen[name] {
+					return fmt.Errorf("route %q fusion_judge.judge references unknown provider %q", r.Model, name)
+				}
+			}
+			if r.FusionJudge.MinPanel < 0 || r.FusionJudge.GraceMs < 0 || r.FusionJudge.TimeoutMs < 0 {
+				return fmt.Errorf("route %q fusion_judge has a negative value", r.Model)
+			}
+		}
+		if r.Strategy == "fusion_judge" && len(r.Candidates) < 2 {
+			return fmt.Errorf("route %q uses fusion_judge with %d candidates (need at least 2)", r.Model, len(r.Candidates))
+		}
 		for _, cand := range r.Candidates {
 			if !seen[cand.Provider] {
 				return fmt.Errorf("route %q references unknown provider %q", r.Model, cand.Provider)
@@ -363,7 +399,7 @@ func validStrategy(s string) bool {
 	switch s {
 	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion",
 		"p2c", "reset_aware", "fill_first", "auto", "lowest_usage", "peak_ewma", "least_connections",
-		"consistent_hash":
+		"consistent_hash", "fusion_judge":
 		return true
 	}
 	return false

@@ -136,6 +136,14 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 				rt.AffinityTTL = time.Duration(rc.Affinity.TTLMs) * time.Millisecond
 			}
 		}
+		if rc.FusionJudge != nil {
+			rt.FusionJudge = router.FusionJudgeConfig{
+				Judge:     rc.FusionJudge.Judge,
+				MinPanel:  rc.FusionJudge.MinPanel,
+				GraceMs:   rc.FusionJudge.GraceMs,
+				TimeoutMs: rc.FusionJudge.TimeoutMs,
+			}
+		}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
 				Provider:      byName[cc.Provider],

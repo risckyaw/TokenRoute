@@ -780,12 +780,21 @@ type affinityInfo struct {
 	keySrc byte // 'h' | 'k'
 }
 
+// fusionInfo reports which fusion path served the request (decision header).
+// kind: "" = none, "1" = the racing fusion strategy, "judge" = fusion_judge
+// (with the panel size and how many members answered).
+type fusionInfo struct {
+	kind    string
+	panel   int
+	answers int
+}
+
 // runRoute executes the failover (or fusion) loop for one route and, when
 // every candidate fails retryably, follows the route's fallback_routes
 // (LiteLLM fallbacks): other virtual models tried in order, max 3 route
 // hops, cycles skipped via the visited set. Client errors (4xx relayed
 // as-is) never trigger fallback — failoverCtx returns those as resp != nil.
-func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string, clientHdr http.Header, keyStr string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, aff affinityInfo) {
+func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string, clientHdr http.Header, keyStr, reqID string, kinfo *authKeyInfo) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fusion fusionInfo, aff affinityInfo) {
 	sel := router.ParseTagSelector(tagHeader)
 	visited := map[string]bool{model: true}
 	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
@@ -816,7 +825,15 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 		var le error
 		if strategy == router.StrategyFusion && !stream && len(candidates) > 1 {
 			cand, resp, lfr, le, at = s.fusionRun(ctx, hdr, body, candidates[:2])
-			fused = true
+			fusion.kind = "1"
+		} else if strategy == router.StrategyFusionJudge && cur != nil && len(candidates) > 1 {
+			// Panel fan-out + judge synthesis. Circuit/quota filtering already
+			// trimmed `candidates`, so an unavailable panel member is simply
+			// absent from the fan-out.
+			var panelN, answerN int
+			cand, resp, lfr, le, at, panelN, answerN = s.fusionJudgeRun(ctx, hdr, body,
+				candidates, fusionJudgeConfig(cur), stream, reqID, model, kinfo)
+			fusion.kind, fusion.panel, fusion.answers = "judge", panelN, answerN
 		} else {
 			tryCands := candidates
 			// skip_retry_on_failure (new-api): on an affinity HIT only the
@@ -844,10 +861,10 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			if affinityOn && pinHash != 0 && resp.StatusCode < 500 {
 				s.router.RecordAffinityTTL(pinHash, cand.Provider.Name(), cand.Model, pinTTL)
 			}
-			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
+			return cand, resp, lastFailResp, lastErr, attempts, fusion, aff
 		}
 		if cur == nil || hops >= 3 || (aff.hit && skipRetry) {
-			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
+			return cand, resp, lastFailResp, lastErr, attempts, fusion, aff
 		}
 		// All candidates failed retryably: try the next fallback route.
 		var next *router.Route
@@ -862,7 +879,7 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			}
 		}
 		if next == nil {
-			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
+			return cand, resp, lastFailResp, lastErr, attempts, fusion, aff
 		}
 		candidates = s.router.OrderCandidatesCaps(next, sel, hashRingValueHdr(next, clientHdr, keyStr), router.DetectRequiredModalities(body))
 		if len(candidates) == 0 {
@@ -1017,13 +1034,13 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	var lastFailResp *http.Response
 	var attempts int
-	fused := false
+	var fusion fusionInfo
 	// Weighted token estimate (new-api estimator port): char-class weights
 	// per provider family of the first candidate (openai/anthropic/gemini
 	// -> openai/claude/gemini weights).
 	est := estimateChatTokens(body, estimateFamily(s.providerTypes[candidates[0].Provider.Name()]))
 	var aff affinityInfo
-	cand, resp, lastFailResp, lastErr, attempts, fused, aff = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"), r.Header, keyString(k))
+	cand, resp, lastFailResp, lastErr, attempts, fusion, aff = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"), r.Header, keyString(k), reqID, keyInfo(k))
 	setDecisionHeader(w, cand, strategy, attempts)
 	if aff.hit {
 		// ;affinity=hit kept for compatibility; ;aff=h|k marks the key source
@@ -1034,8 +1051,12 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+marker)
 	}
-	if fused {
-		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")
+	if fusion.kind != "" {
+		marker := ";fusion=" + fusion.kind
+		if fusion.kind == "judge" {
+			marker += ";panel=" + strconv.Itoa(fusion.panel) + ";answers=" + strconv.Itoa(fusion.answers)
+		}
+		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+marker)
 	}
 	if len(caps) > 0 {
 		// Capability requirements detected in the body (image/pdf/audio/video):

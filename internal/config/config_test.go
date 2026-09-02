@@ -206,3 +206,79 @@ routes:
 		t.Fatalf("unset policy = %v, %v; want nil, nil", fr, err)
 	}
 }
+
+// fusion_judge is strategy-gated, needs >=2 candidates, and its judge must
+// name a known provider as "provider/model".
+func TestFusionJudgeConfigValidation(t *testing.T) {
+	tmpl := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+  - name: p2
+    type: openai
+    base_url: http://y
+routes:
+  - model: panel
+    strategy: %s
+    fusion_judge: {judge: "%s", min_panel: 2, grace_ms: 1500, timeout_ms: 60000}
+    candidates:
+      - provider: p1
+        model: a
+      - provider: p2
+        model: b
+`
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "fusion_judge", "p1/a"))); err != nil {
+		t.Fatalf("valid fusion_judge rejected: %v", err)
+	}
+	// Judge may be a model not listed as a candidate, as long as the provider exists.
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "fusion_judge", "p2/other"))); err != nil {
+		t.Fatalf("off-panel judge rejected: %v", err)
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "priority", "p1/a"))); err == nil {
+		t.Fatal("fusion_judge block on another strategy must fail load")
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "fusion_judge", "nope/a"))); err == nil {
+		t.Fatal("judge naming an unknown provider must fail load")
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, "fusion_judge", "bare-model"))); err == nil {
+		t.Fatal("judge without provider/model form must fail load")
+	}
+	// Fewer than 2 candidates leaves nothing to fuse.
+	single := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: panel
+    strategy: fusion_judge
+    candidates:
+      - provider: p1
+        model: a
+`
+	if _, err := Load(writeCfg(t, single)); err == nil {
+		t.Fatal("fusion_judge with 1 candidate must fail load")
+	}
+	// The block is optional: defaults apply.
+	noBlock := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+  - name: p2
+    type: openai
+    base_url: http://y
+routes:
+  - model: panel
+    strategy: fusion_judge
+    candidates:
+      - provider: p1
+        model: a
+      - provider: p2
+        model: b
+`
+	if _, err := Load(writeCfg(t, noBlock)); err != nil {
+		t.Fatalf("fusion_judge without a config block rejected: %v", err)
+	}
+}
