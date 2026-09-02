@@ -242,7 +242,7 @@ func (c *Config) Validate() error {
 func validStrategy(s string) bool {
 	switch s {
 	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion",
-		"p2c", "reset_aware", "fill_first", "auto":
+		"p2c", "reset_aware", "fill_first", "auto", "lowest_usage":
 		return true
 	}
 	return false

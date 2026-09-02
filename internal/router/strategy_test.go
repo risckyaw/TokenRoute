@@ -148,3 +148,68 @@ func TestOrderCandidatesSkipsOpenCircuit(t *testing.T) {
 		t.Fatalf("got %v, want [b] (a circuit open)", got)
 	}
 }
+
+func TestLowestUsageOrdering(t *testing.T) {
+	hi := &fakeProvider{name: "hi", priority: 1}
+	mid := &fakeProvider{name: "mid", priority: 5}
+	lo := &fakeProvider{name: "lo", priority: 10}
+	rt := &Route{Model: "m", Strategy: StrategyLowestUsage, Candidates: []Candidate{
+		{Provider: hi, Model: "a"}, {Provider: mid, Model: "b"}, {Provider: lo, Model: "c"},
+	}}
+	r := New([]provider.Provider{hi, mid, lo}, []*Route{rt})
+
+	// Unseen candidates first (all zero): priority order hi, mid, lo.
+	got := r.OrderCandidates(rt)
+	if got[0].Provider.Name() != "hi" || got[1].Provider.Name() != "mid" || got[2].Provider.Name() != "lo" {
+		t.Fatalf("unseen order: %v %v %v", got[0].Provider.Name(), got[1].Provider.Name(), got[2].Provider.Name())
+	}
+	// Load hi with tokens: it sinks behind the zero-usage others.
+	r.RecordTokens("hi", 1000)
+	got = r.OrderCandidates(rt)
+	if got[0].Provider.Name() == "hi" {
+		t.Fatalf("loaded provider must sink: %v", got[0].Provider.Name())
+	}
+	if got[2].Provider.Name() != "hi" {
+		t.Fatalf("hi must be last: %v %v %v", got[0].Provider.Name(), got[1].Provider.Name(), got[2].Provider.Name())
+	}
+	// Tie between mid and lo (both 0): priority wins (mid before lo).
+	if got[0].Provider.Name() != "mid" || got[1].Provider.Name() != "lo" {
+		t.Fatalf("tie must keep priority: %v %v", got[0].Provider.Name(), got[1].Provider.Name())
+	}
+	// mid gets fewer tokens than lo: mid first, lo second, hi last.
+	r.RecordTokens("mid", 100)
+	r.RecordTokens("lo", 500)
+	got = r.OrderCandidates(rt)
+	want := []string{"mid", "lo", "hi"}
+	for i, name := range want {
+		if got[i].Provider.Name() != name {
+			t.Fatalf("order[%d] = %s, want %s", i, got[i].Provider.Name(), name)
+		}
+	}
+}
+
+func TestLowestUsageWindowRollover(t *testing.T) {
+	hi := &fakeProvider{name: "hi", priority: 1}
+	lo := &fakeProvider{name: "lo", priority: 10}
+	rt := &Route{Model: "m", Strategy: StrategyLowestUsage, Candidates: []Candidate{
+		{Provider: hi, Model: "a"}, {Provider: lo, Model: "b"},
+	}}
+	r := New([]provider.Provider{hi, lo}, []*Route{rt})
+	r.RecordTokens("hi", 5000)
+	// Simulate minute rollover by resetting the window start.
+	r.latMu.Lock()
+	r.windows["hi"].start = time.Now().Add(-61 * time.Second)
+	r.latMu.Unlock()
+	// Next RecordResult rolls the window (toks reset); hi becomes unseen-fresh.
+	r.RecordResult("hi", time.Millisecond, true)
+	got := r.OrderCandidates(rt)
+	if got[0].Provider.Name() != "hi" {
+		t.Fatalf("after rollover hi must be first (0 toks): %v", got[0].Provider.Name())
+	}
+}
+
+func TestValidStrategyLowestUsage(t *testing.T) {
+	if !ValidStrategy(StrategyLowestUsage) {
+		t.Fatal("lowest_usage must be a valid strategy")
+	}
+}

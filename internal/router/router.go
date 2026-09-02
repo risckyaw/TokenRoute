@@ -26,6 +26,7 @@ const (
 	StrategyResetAware   = "reset_aware" // prefer candidates whose quota window resets soonest
 	StrategyFillFirst    = "fill_first"  // exhaust first candidate's quota before moving on
 	StrategyAuto         = "auto"        // composite multi-factor scoring (OmniRoute port)
+	StrategyLowestUsage  = "lowest_usage" // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -33,7 +34,7 @@ func ValidStrategy(s string) bool {
 	switch s {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
 		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
-		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto:
+		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage:
 		return true
 	}
 	return false
@@ -385,6 +386,18 @@ func (r *Router) OrderCandidates(rt *Route) []Candidate {
 		sort.SliceStable(allowed, func(i, j int) bool {
 			return counts[allowed[i].Provider.Name()] < counts[allowed[j].Provider.Name()]
 		})
+	case StrategyLowestUsage:
+		// Fewest observed tokens this minute first (LiteLLM lowest_tpm_rpm_v2);
+		// unseen candidates (0) sort first; ties keep priority order.
+		r.latMu.Lock()
+		toks := make(map[string]int, len(r.windows))
+		for name, w := range r.windows {
+			toks[name] = w.toks
+		}
+		r.latMu.Unlock()
+		sort.SliceStable(allowed, func(i, j int) bool {
+			return toks[allowed[i].Provider.Name()] < toks[allowed[j].Provider.Name()]
+		})
 	case StrategyP2C:
 		// Power-of-2-choices (OmniRoute p2c): draw two distinct candidates at
 		// random, put the least-loaded first, keep the rest in priority order.
@@ -581,6 +594,22 @@ func (r *Router) RecordResultKind(providerName string, latency time.Duration, su
 			rt.lastGood.Store("")
 		}
 	}
+}
+
+// RecordTokens adds actual usage to the provider's current-minute window
+// (lowest_usage strategy signal). Called by the server after a response.
+func (r *Router) RecordTokens(providerName string, tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	r.latMu.Lock()
+	defer r.latMu.Unlock()
+	w := r.windows[providerName]
+	if w == nil {
+		w = &window{start: time.Now()}
+		r.windows[providerName] = w
+	}
+	w.toks += tokens
 }
 
 // OpenCircuitFor opens a provider's circuit for a custom duration

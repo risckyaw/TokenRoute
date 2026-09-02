@@ -812,6 +812,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// (reset_aware/fill_first/auto) see the remaining budget.
 	if entry.TotalTokens > 0 && entry.Provider != "" && entry.Provider != "cache" {
 		s.router.Quota().Record(entry.Provider, entry.Model, int64(entry.TotalTokens))
+		s.router.RecordTokens(entry.Provider, entry.TotalTokens)
 	}
 	if ck != "" && respBody != nil && entry.Status == http.StatusOK && entry.TotalTokens > 0 {
 		s.cache.store(ck, &cacheEntry{
@@ -888,6 +889,9 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 		if err := s.keys.SpendUSD(k.ID, *entry.CostUSD); err != nil {
 			slog.Error("spend usd", "err", err, "key_id", k.ID)
 		}
+	}
+	if entry.TotalTokens > 0 && entry.Provider != "" {
+		s.router.RecordTokens(entry.Provider, entry.TotalTokens)
 	}
 	s.logEntry(r.Context(), entry)
 }
