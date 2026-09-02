@@ -299,6 +299,34 @@ func healthTargets(cfg *config.Config, rt *router.Router) []server.HealthTarget 
 	return out
 }
 
+// balanceTargets resolves the opt-in per-provider balance probes.
+func balanceTargets(cfg *config.Config) []server.BalanceTarget {
+	var out []server.BalanceTarget
+	for _, pc := range cfg.Providers {
+		bp := pc.BalanceProbe
+		if bp == nil || bp.URL == "" {
+			continue
+		}
+		minUSD := bp.MinUSD
+		if minUSD <= 0 {
+			minUSD = 0.01
+		}
+		interval := time.Duration(bp.IntervalMs) * time.Millisecond
+		if interval <= 0 {
+			interval = 5 * time.Minute
+		}
+		key := pc.APIKey
+		if key == "" && len(pc.APIKeys) > 0 {
+			key = pc.APIKeys[0] // pool: any key sees the same account balance
+		}
+		out = append(out, server.BalanceTarget{
+			Provider: pc.Name, URL: bp.URL, APIKey: key,
+			Interval: interval, MinUSD: minUSD,
+		})
+	}
+	return out
+}
+
 // openDB opens the shared usage/auth DB; fatal at startup, skipped on reload failure.
 func openDB(path string) (*sql.DB, error) {
 	return usage.OpenDB(path)
@@ -385,6 +413,9 @@ func main() {
 	hcCtx, hcCancel := context.WithCancel(context.Background())
 	defer hcCancel()
 	server.RunHealthChecks(hcCtx, state.router, healthTargets(cfg, state.router))
+	// Account-balance probes (opt-in per provider): pre-emptively mark
+	// low-balance providers exhausted in the quota ledger.
+	server.RunBalanceProbes(hcCtx, state.router, balanceTargets(cfg))
 	var current atomic.Pointer[serverState]
 	current.Store(state)
 

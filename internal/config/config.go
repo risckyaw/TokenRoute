@@ -76,6 +76,19 @@ type ProviderConfig struct {
 	ParamDelete    []string         `yaml:"param_delete"`
 	HeaderOverride map[string]string `yaml:"header_override"`
 	HeaderPass     []string         `yaml:"header_pass"`
+	// BalanceProbe polls a DeepSeek-style balance endpoint (opt-in): below
+	// min_usd the provider is marked out of balance and quota-aware strategies
+	// treat it as exhausted until a probe above the threshold clears it.
+	BalanceProbe *BalanceProbeConfig `yaml:"balance_probe"`
+}
+
+// BalanceProbeConfig configures one provider's account-balance probe
+// (9router usage/deepseek.js). The URL is explicit so any provider exposing
+// {"balance_infos":[{"total_balance":"1.23"}]} works.
+type BalanceProbeConfig struct {
+	URL        string  `yaml:"url"`
+	IntervalMs int     `yaml:"interval_ms"` // default 300000
+	MinUSD     float64 `yaml:"min_usd"`     // default 0.01
 }
 
 type CandidateConfig struct {
@@ -315,6 +328,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate provider name: %s", p.Name)
 		}
 		seen[p.Name] = true
+		if bp := p.BalanceProbe; bp != nil {
+			if bp.URL == "" {
+				return fmt.Errorf("provider %q balance_probe needs a url", p.Name)
+			}
+			if bp.IntervalMs < 0 || bp.MinUSD < 0 {
+				return fmt.Errorf("provider %q balance_probe has a negative value", p.Name)
+			}
+		}
 	}
 	routeModels := map[string]bool{}
 	for _, r := range c.Routes {

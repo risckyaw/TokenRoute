@@ -274,6 +274,7 @@ func (s *srv) adminProviders(w http.ResponseWriter, _ *http.Request) {
 			"circuit":        s.router.CircuitState(p.Name()),
 			"disabled":       s.router.ProviderDisabled(p.Name()),
 			"ema_latency_ms": s.router.LatencyMs(p.Name()),
+			"balance_low":    s.router.Quota().BalanceLow(p.Name()),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"providers": out})

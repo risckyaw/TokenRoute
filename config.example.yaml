@@ -89,6 +89,18 @@ providers:
     #   - "${DEEPSEEK_API_KEY_2}"
     priority: 5                     # lower = more preferred
     timeout_ms: 120000
+    # Account-balance probe (9router usage/deepseek.js port; opt-in, default
+    # off). Polls a DeepSeek-style endpoint returning
+    # {"balance_infos":[{"total_balance":"1.23"}]} with this provider's key.
+    # Below min_usd the provider is marked out of balance: quota-aware
+    # strategies (reset_aware/fill_first/auto) treat every model of it as
+    # exhausted, so traffic drains off BEFORE an empty account starts answering
+    # 429s. A probe above the threshold clears it; probe failures (network,
+    # 401, junk) are logged and change nothing. Multiple currency entries are
+    # summed WITHOUT conversion — this is a "is there money left" floor check,
+    # not an accounting figure. Visible as balance_low in GET /admin/providers.
+    # url is explicit so any provider exposing that shape works.
+    #balance_probe: {url: "https://api.deepseek.com/user/balance", interval_ms: 300000, min_usd: 0.10}
 
   - name: ollama
     type: openai

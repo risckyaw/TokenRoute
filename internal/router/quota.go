@@ -41,10 +41,35 @@ type QuotaLedger struct {
 	mu   sync.Mutex
 	rows map[string]*ProviderQuota // provider|model -> quota
 	now  func() time.Time
+	// balanceLow marks providers whose account balance fell below the probed
+	// threshold (9router usage/deepseek.js): every model of that provider reads
+	// as exhausted until the next probe clears it.
+	balanceLow map[string]bool
 }
 
 func NewQuotaLedger() *QuotaLedger {
-	return &QuotaLedger{rows: map[string]*ProviderQuota{}, now: time.Now}
+	return &QuotaLedger{rows: map[string]*ProviderQuota{}, now: time.Now, balanceLow: map[string]bool{}}
+}
+
+// SetBalanceLow marks (or clears) a provider as out of account balance. A
+// low-balance provider reports every model exhausted to quota-aware strategies
+// (Remaining -> 0, known=true), so fill_first/auto/reset_aware sink it before
+// traffic discovers the empty balance through a 429.
+func (l *QuotaLedger) SetBalanceLow(provider string, low bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if low {
+		l.balanceLow[provider] = true
+		return
+	}
+	delete(l.balanceLow, provider)
+}
+
+// BalanceLow reports whether a provider is marked out of balance.
+func (l *QuotaLedger) BalanceLow(provider string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.balanceLow[provider]
 }
 
 func quotaKey(provider, model string) string { return provider + "|" + model }
@@ -94,6 +119,11 @@ func (l *QuotaLedger) observed(q *ProviderQuota) *upstreamObs {
 func (l *QuotaLedger) Remaining(provider, model string) (remaining int64, ratio float64, known bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.balanceLow[provider] {
+		// Probed account balance is below the configured floor: nothing this
+		// provider offers is affordable, regardless of window accounting.
+		return 0, 0, true
+	}
 	q := l.rows[quotaKey(provider, model)]
 	if q == nil {
 		return 0, 1, false

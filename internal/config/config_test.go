@@ -282,3 +282,50 @@ routes:
 		t.Fatalf("fusion_judge without a config block rejected: %v", err)
 	}
 }
+
+// balance_probe is opt-in and needs a url; negative knobs fail load.
+func TestBalanceProbeConfig(t *testing.T) {
+	tmpl := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+    balance_probe: %s
+routes:
+  - model: auto
+    candidates:
+      - provider: p1
+        model: up
+`
+	cfg, err := Load(writeCfg(t, fmt.Sprintf(tmpl, `{url: "https://api.deepseek.com/user/balance", interval_ms: 300000, min_usd: 0.10}`)))
+	if err != nil {
+		t.Fatalf("valid balance_probe rejected: %v", err)
+	}
+	if bp := cfg.Providers[0].BalanceProbe; bp == nil || bp.MinUSD != 0.10 {
+		t.Fatalf("balance_probe not parsed: %+v", cfg.Providers[0].BalanceProbe)
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, `{interval_ms: 300000}`))); err == nil {
+		t.Fatal("balance_probe without url must fail load")
+	}
+	if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, `{url: "http://x", min_usd: -1}`))); err == nil {
+		t.Fatal("negative min_usd must fail load")
+	}
+	// Absent block = disabled (the default).
+	bare, err := Load(writeCfg(t, `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: auto
+    candidates:
+      - provider: p1
+        model: up
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Providers[0].BalanceProbe != nil {
+		t.Fatal("balance_probe must be nil (disabled) by default")
+	}
+}

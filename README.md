@@ -11,14 +11,24 @@ speak one API.
 - **Passthrough proxy** — only the top-level `model` field is rewritten;
   raw bodies forwarded, raw upstream responses (incl. errors) relayed, SSE
   streamed unbuffered.
-- **Routing strategies** — priority, round_robin, least_latency, weighted,
-  cost, lkgp (last-known-good provider), headroom (fewest requests in the
-  last 60s first), fusion (race first two candidates, fastest/cheapest 200
-  wins), p2c (power-of-2-choices), reset_aware (quota window resetting
-  soonest first), fill_first (exhaust one candidate's quota before the
-  next), auto (composite score: health × latency × cost × quota headroom),
-  lowest_usage (fewest tokens in the current minute first) — per virtual
-  model.
+- **Routing strategies** — priority, round_robin (with optional `sticky: N`),
+  least_latency, weighted, cost, lkgp (last-known-good provider), headroom
+  (fewest requests in the last 60s first), fusion (race first two candidates,
+  fastest/cheapest 200 wins), fusion_judge (panel fan-out + judge synthesis),
+  p2c (power-of-2-choices), reset_aware (quota window resetting soonest
+  first), fill_first (exhaust one candidate's quota before the next), auto
+  (composite score: health × latency × cost × quota headroom), lowest_usage
+  (fewest tokens in the current minute first) — per virtual model.
+- **Capability-aware routing** — content blocks in the request body
+  (image/audio/pdf/video) rank candidates whose models accept them first,
+  using the models.dev catalog's synced modalities; decision header gains
+  `;caps=image,pdf`.
+- **Per-failure cooldowns** — optional `failure_rules:` (9router port):
+  ordered text/status rules, each setting that failure's circuit cooldown or
+  an escalating per-provider backoff (2s → 5min cap, reset on success).
+- **Account-balance probes** — optional per-provider `balance_probe:` marks a
+  provider out of balance before traffic hits 429s; quota-aware strategies
+  treat it as exhausted until a probe clears it.
 - **Percent circuit threshold** — optional `circuit: {mode: percent,
   failure_percent, min_requests}` trips on a failure ratio in the current
   minute instead of consecutive failures (LiteLLM semantics).
@@ -272,6 +282,30 @@ the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
 
+## Account-balance probes
+
+`balance_probe` (9router `usage/deepseek.js`) polls a provider's balance
+endpoint in the background so an empty account is discovered *before* traffic
+runs into 429s:
+
+```yaml
+providers:
+  - name: deepseek
+    balance_probe: {url: "https://api.deepseek.com/user/balance", interval_ms: 300000, min_usd: 0.10}
+```
+
+The probe GETs the URL with that provider's key and sums
+`balance_infos[].total_balance`. Below `min_usd` the provider is marked out of
+balance in the quota ledger, which makes every one of its models read as
+exhausted to the quota-aware strategies (`reset_aware`, `fill_first`, `auto`),
+sinking it behind funded providers; a WARN is logged on the transition. A probe
+above the threshold clears the mark. Probe failures (network, 401, unparseable
+payload) are logged and change nothing — a broken probe never fails closed, and
+never clears an existing mark. Multiple currency entries are summed *without*
+conversion: this is a "is there any credit left" floor check, not an accounting
+figure. `GET /admin/providers` reports the state as `balance_low`. Opt-in per
+provider; the URL is explicit, so any provider exposing the same shape works.
+
 ## fusion_judge
 
 `strategy: fusion_judge` (9router `handleFusionChat`) answers one request with a
@@ -393,8 +427,8 @@ terminal failures are never modified.
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
 | `max_body_mb` | Max request body size in MB, default 10 |
 | `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard; optional `expr` (expression pricing, see Features) wins over flat rates for chat cost |
-| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled), optional `param_override` / `param_delete` / `header_override` / `header_pass` (set-only request overrides) |
-| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), optional `affinity: {enabled, key_header, ttl_ms, skip_retry_on_failure}` (header-keyed pinning; wins over the shorthand), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering, optional `param_override`) |
+| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled), optional `balance_probe: {url, interval_ms, min_usd}` (account-balance polling; default disabled), optional `param_override` / `param_delete` / `header_override` / `header_pass` (set-only request overrides) |
+| `routes[]` | Virtual `model`, optional `strategy`, optional `sticky` (round_robin only), optional `fusion_judge: {judge, min_panel, grace_ms, timeout_ms}` (fusion_judge only), optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), optional `affinity: {enabled, key_header, ttl_ms, skip_retry_on_failure}` (header-keyed pinning; wins over the shorthand), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering, optional `param_override`) |
 | `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |
 | `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
 | `retry_policy` | Optional `{retry_status_ranges, never_retry, disable_status_ranges, disable_keywords}` failover/disable overrides (unset = built-in) |
