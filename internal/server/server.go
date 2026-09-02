@@ -35,28 +35,6 @@ const defaultMaxBodyMB = 10
 // errContextExceeded marks a candidate skipped by the context-window guard.
 var errContextExceeded = errors.New("prompt exceeds model context window")
 
-// estimateChatTokens approximates prompt tokens as len(messages JSON)/4.
-func estimateChatTokens(body []byte) int {
-	var parsed struct {
-		Messages json.RawMessage `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Messages) == 0 {
-		return len(body) / 4
-	}
-	return len(parsed.Messages) / 4
-}
-
-// estimateEmbedTokens approximates prompt tokens as len(input)/4 (chars).
-func estimateEmbedTokens(body []byte) int {
-	var parsed struct {
-		Input json.RawMessage `json:"input"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Input) == 0 {
-		return len(body) / 4
-	}
-	return len(parsed.Input) / 4
-}
-
 type ctxKey int
 
 const ctxAPIKey ctxKey = iota
@@ -183,6 +161,18 @@ func (s *srv) price(model string) (usage.Price, bool) {
 	defer s.priceMu.RUnlock()
 	p, ok := s.prices[model]
 	return p, ok
+}
+
+// estimateFamily maps a provider type to an estimator weight family.
+func estimateFamily(providerType string) string {
+	switch providerType {
+	case "anthropic":
+		return "claude"
+	case "gemini":
+		return "gemini"
+	default:
+		return "openai"
+	}
 }
 
 // exprCost evaluates a model's pricing expression against the entry's usage
@@ -822,7 +812,10 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastFailResp *http.Response
 	var attempts int
 	fused := false
-	est := estimateChatTokens(body)
+	// Weighted token estimate (new-api estimator port): char-class weights
+	// per provider family of the first candidate (openai/anthropic/gemini
+	// -> openai/claude/gemini weights).
+	est := estimateChatTokens(body, estimateFamily(s.providerTypes[candidates[0].Provider.Name()]))
 	var affinityHit bool
 	cand, resp, lastFailResp, lastErr, attempts, fused, affinityHit = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
 	setDecisionHeader(w, cand, strategy, attempts)

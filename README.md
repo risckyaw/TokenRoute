@@ -70,7 +70,10 @@ speak one API.
   `budget_exceeded`.
 - **Context-window guard** — optional `context_tokens` per priced model;
   oversized prompts skip that candidate (400 `context_length_exceeded`
-  when none fit).
+  when none fit). Prompt tokens estimated by a weighted char-class
+  heuristic calibrated per provider family (openai/claude/gemini weights;
+  CJK-heavy prompts estimate ~3–5× higher than len/4, so oversized CJK
+  prompts are caught correctly).
 - **Prometheus metrics** — `GET /metrics` (no auth, both listeners):
   request/token/cache counters, latency histogram, circuit-open gauge.
 - **Per-request timeout** — `X-Timeout-Ms` header overrides the provider
