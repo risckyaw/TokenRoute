@@ -37,7 +37,12 @@ speak one API.
   route) pins a cacheable prompt prefix (explicit `cache_control`, or
   system+first-user ≥ 1024 bytes) to the provider+model that served it for
   1h, so provider-side prompt caches hit; decision header gains
-  `;affinity=hit`.
+  `;affinity=hit`. Extended per-route form `affinity: {enabled, key_header,
+  ttl_ms, skip_retry_on_failure}` pins by a request header's value hash
+  instead (session/thread ids; decision header `;aff=h` vs `;aff=k` for
+  prefix) and `skip_retry_on_failure` relays a pinned failure to the client
+  instead of failing over — the pinned channel holds per-session state
+  (new-api channel affinity port).
 - **Background health checks** — `health_check: {enabled, interval_ms,
   model}` per provider (or global) probes with a minimal completion so
   circuit state and latency EMA stay warm; never touches usage log or quota
@@ -244,8 +249,8 @@ gateway-local (never forwarded upstream).
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
 | `max_body_mb` | Max request body size in MB, default 10 |
 | `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard; optional `expr` (expression pricing, see Features) wins over flat rates for chat cost |
-| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled) |
-| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering) |
+| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled), optional `param_override` / `param_delete` / `header_override` / `header_pass` (set-only request overrides) |
+| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), optional `affinity: {enabled, key_header, ttl_ms, skip_retry_on_failure}` (header-keyed pinning; wins over the shorthand), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering, optional `param_override`) |
 | `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |
 | `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
 | `retry_policy` | Optional `{retry_status_ranges, never_retry, disable_status_ranges, disable_keywords}` failover/disable overrides (unset = built-in) |

@@ -147,6 +147,15 @@ routes:
     # caches hit; X-TokenRoute-Decision gains ;affinity=hit on a pin hit.
     # Global default: top-level prompt_cache_affinity: true (default false).
     #prompt_cache_affinity: true
+    # affinity: extended pin config (new-api channel affinity port); wins
+    # over the shorthand above. key_header pins by that request header's
+    # value hash (e.g. a session/thread id used by CLI agents); unset =
+    # prompt-prefix hashing. skip_retry_on_failure: on an affinity HIT the
+    # pinned candidate's failure is relayed to the client, never retried
+    # elsewhere (the pinned channel holds per-session state; retrying loses
+    # it and double-bills). Decision header marks the key source: ;aff=h
+    # (header) or ;aff=k (prompt prefix), alongside ;affinity=hit.
+    #affinity: {enabled: true, key_header: "X-Session-Id", ttl_ms: 3600000, skip_retry_on_failure: false}
     candidates:
       - provider: deepseek
         model: deepseek-chat

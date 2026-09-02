@@ -131,12 +131,33 @@ func (a *AffinityCache) Get(hash uint64) (AffinityPin, bool) {
 
 // Put records prefix -> provider+model for the TTL.
 func (a *AffinityCache) Put(hash uint64, providerName, model string) {
+	a.PutTTL(hash, providerName, model, 0)
+}
+
+// PutTTL is Put with a per-entry TTL override (0 = cache default).
+func (a *AffinityCache) PutTTL(hash uint64, providerName, model string, ttl time.Duration) {
 	if a == nil || hash == 0 {
 		return
+	}
+	if ttl <= 0 {
+		ttl = a.ttl
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// ponytail: unbounded map keyed by content hash; add an LRU cap when
 	// cardinality matters (entries expire after ttl, bounding live size).
-	a.m[hash] = AffinityPin{Provider: providerName, Model: model, ExpiresAt: a.now().Add(a.ttl)}
+	a.m[hash] = AffinityPin{Provider: providerName, Model: model, ExpiresAt: a.now().Add(ttl)}
+}
+
+// HeaderKeyHash hashes a key-header value as an affinity key (new-api
+// channel affinity: session/thread ids pin to one channel). Distinct
+// namespace from prefix hashes to avoid cross-source collisions.
+func HeaderKeyHash(value string) uint64 {
+	if value == "" {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("hdr:"))
+	_, _ = h.Write([]byte(value))
+	return h.Sum64()
 }

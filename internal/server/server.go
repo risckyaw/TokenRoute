@@ -670,22 +670,42 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 	return cand, resp, lastFailResp, lastErr, attempts
 }
 
+// affinityInfo reports how a request was pinned (for the decision header).
+// keySrc: "h" (key_header value) or "k" (prompt prefix); "" = not pinned.
+type affinityInfo struct {
+	hit    bool
+	keySrc byte // 'h' | 'k'
+}
+
 // runRoute executes the failover (or fusion) loop for one route and, when
 // every candidate fails retryably, follows the route's fallback_routes
 // (LiteLLM fallbacks): other virtual models tried in order, max 3 route
 // hops, cycles skipped via the visited set. Client errors (4xx relayed
 // as-is) never trigger fallback — failoverCtx returns those as resp != nil.
-func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, affinityHit bool) {
+func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byte, model string, candidates []router.Candidate, strategy string, stream bool, estTokens int, tagHeader string, clientHdr http.Header) (cand router.Candidate, resp, lastFailResp *http.Response, lastErr error, attempts int, fused bool, aff affinityInfo) {
 	sel := router.ParseTagSelector(tagHeader)
 	visited := map[string]bool{model: true}
 	cur := s.router.Resolve(model) // nil for passthrough (no fallback config)
-	// Prompt-cache affinity: hash the cacheable prefix once; a live pin
-	// reorders candidates so the pinned provider serves it again.
-	prefixHash := router.CachePrefixHash(body)
-	affinityOn := cur != nil && (cur.PromptCacheAffinity || s.router.AffinityDefault)
-	pinned := false
-	if affinityOn && prefixHash != 0 {
-		pinned = s.router.PinByAffinity(candidates, prefixHash)
+	// Affinity key: the route's key_header value hash when configured
+	// (new-api channel affinity; session/thread ids), else the cacheable
+	// prompt-prefix hash (LiteLLM prompt_caching_cache).
+	affinityOn := cur != nil && (cur.PromptCacheAffinity || s.router.AffinityDefault || cur.AffinityKeyHeader != "")
+	pinHash, pinTTL, skipRetry := uint64(0), time.Duration(0), false
+	if cur != nil && cur.AffinityKeyHeader != "" {
+		if v := clientHdr.Get(cur.AffinityKeyHeader); v != "" {
+			pinHash = router.HeaderKeyHash(v)
+			aff.keySrc = 'h'
+		}
+		pinTTL = cur.AffinityTTL
+		skipRetry = cur.AffinitySkipRetry
+	} else if affinityOn {
+		pinHash = router.CachePrefixHash(body)
+		pinTTL = cur.AffinityTTL
+		skipRetry = cur.AffinitySkipRetry
+		aff.keySrc = 'k'
+	}
+	if affinityOn && pinHash != 0 {
+		aff.hit = s.router.PinByAffinity(candidates, pinHash)
 	}
 	for hops := 0; ; hops++ {
 		var at int
@@ -695,7 +715,15 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			cand, resp, lfr, le, at = s.fusionRun(ctx, hdr, body, candidates[:2])
 			fused = true
 		} else {
-			cand, resp, lfr, le, at = s.failoverPass(ctx, hdr, blocked, body, candidates, chatCall, estTokens)
+			tryCands := candidates
+			// skip_retry_on_failure (new-api): on an affinity HIT only the
+			// pinned candidate may serve — the pinned channel holds
+			// per-session state, retrying elsewhere loses it (and double-
+			// bills). The pin hit already reordered it first.
+			if aff.hit && skipRetry {
+				tryCands = candidates[:1]
+			}
+			cand, resp, lfr, le, at = s.failoverPass(ctx, hdr, blocked, body, tryCands, chatCall, estTokens)
 		}
 		attempts += at
 		if lfr != nil {
@@ -708,15 +736,15 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			lastErr = le
 		}
 		if resp != nil {
-			// Pin the serving provider+model for this prefix (any 2xx/4xx
+			// Pin the serving provider+model for this key (any 2xx/4xx
 			// deterministic response proves the deployment serves it).
-			if affinityOn && prefixHash != 0 && resp.StatusCode < 500 {
-				s.router.RecordAffinity(prefixHash, cand.Provider.Name(), cand.Model)
+			if affinityOn && pinHash != 0 && resp.StatusCode < 500 {
+				s.router.RecordAffinityTTL(pinHash, cand.Provider.Name(), cand.Model, pinTTL)
 			}
-			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
+			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
 		}
-		if cur == nil || hops >= 3 {
-			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
+		if cur == nil || hops >= 3 || (aff.hit && skipRetry) {
+			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
 		}
 		// All candidates failed retryably: try the next fallback route.
 		var next *router.Route
@@ -731,7 +759,7 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 			}
 		}
 		if next == nil {
-			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
+			return cand, resp, lastFailResp, lastErr, attempts, fused, aff
 		}
 		candidates = s.router.OrderCandidatesTagged(next, sel)
 		if len(candidates) == 0 {
@@ -740,9 +768,21 @@ func (s *srv) runRoute(ctx context.Context, hdr, blocked http.Header, body []byt
 		}
 		cur = next
 		strategy = next.Strategy
-		affinityOn = next.PromptCacheAffinity || s.router.AffinityDefault
-		if affinityOn && prefixHash != 0 {
-			pinned = s.router.PinByAffinity(candidates, prefixHash)
+		affinityOn = next.PromptCacheAffinity || s.router.AffinityDefault || next.AffinityKeyHeader != ""
+		pinHash, pinTTL, skipRetry = 0, 0, false
+		aff = affinityInfo{}
+		if next.AffinityKeyHeader != "" {
+			if v := clientHdr.Get(next.AffinityKeyHeader); v != "" {
+				pinHash = router.HeaderKeyHash(v)
+				aff.keySrc = 'h'
+			}
+		} else if affinityOn {
+			pinHash = router.CachePrefixHash(body)
+			aff.keySrc = 'k'
+		}
+		pinTTL, skipRetry = next.AffinityTTL, next.AffinitySkipRetry
+		if affinityOn && pinHash != 0 {
+			aff.hit = s.router.PinByAffinity(candidates, pinHash)
 		}
 	}
 }
@@ -845,11 +885,17 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// per provider family of the first candidate (openai/anthropic/gemini
 	// -> openai/claude/gemini weights).
 	est := estimateChatTokens(body, estimateFamily(s.providerTypes[candidates[0].Provider.Name()]))
-	var affinityHit bool
-	cand, resp, lastFailResp, lastErr, attempts, fused, affinityHit = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"))
+	var aff affinityInfo
+	cand, resp, lastFailResp, lastErr, attempts, fused, aff = s.runRoute(r.Context(), hdr, blocked, body, model, candidates, strategy, stream, est, r.Header.Get("X-Route-Tags"), r.Header)
 	setDecisionHeader(w, cand, strategy, attempts)
-	if affinityHit {
-		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";affinity=hit")
+	if aff.hit {
+		// ;affinity=hit kept for compatibility; ;aff=h|k marks the key source
+		// (h = key_header value, k = prompt-prefix hash).
+		marker := ";affinity=hit"
+		if aff.keySrc != 0 {
+			marker += ";aff=" + string(aff.keySrc)
+		}
+		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+marker)
 	}
 	if fused {
 		w.Header().Set("X-TokenRoute-Decision", w.Header().Get("X-TokenRoute-Decision")+";fusion=1")

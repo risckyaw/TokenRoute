@@ -64,6 +64,17 @@ type Route struct {
 	// PromptCacheAffinity pins requests with a cacheable prefix to the
 	// provider+model that served that prefix (overrides global default).
 	PromptCacheAffinity bool
+	// AffinityKeyHeader: when set, pin by the hash of this request header's
+	// value (session/thread id) instead of the prompt prefix. When empty and
+	// PromptCacheAffinity (or global default) is on, prefix hashing applies.
+	AffinityKeyHeader string
+	// AffinityTTL: pin TTL for this route (0 = cache default 1h).
+	AffinityTTL time.Duration
+	// AffinitySkipRetry: on an affinity HIT, do not fail over to other
+	// candidates when the upstream call fails retryably — relay the failure.
+	// Rationale (new-api SkipRetryOnFailure): the pinned channel holds
+	// per-session state; retrying elsewhere loses it and double-bills.
+	AffinitySkipRetry bool
 
 	rr       atomic.Uint64 // round-robin counter
 	lastGood atomic.Value  // string: provider name that served last success (lkgp)
@@ -166,6 +177,13 @@ func (r *Router) PinByAffinity(allowed []Candidate, hash uint64) bool {
 func (r *Router) RecordAffinity(hash uint64, providerName, model string) {
 	if r.affinity != nil {
 		r.affinity.Put(hash, providerName, model)
+	}
+}
+
+// RecordAffinityTTL is RecordAffinity with a per-route TTL override.
+func (r *Router) RecordAffinityTTL(hash uint64, providerName, model string, ttl time.Duration) {
+	if r.affinity != nil {
+		r.affinity.PutTTL(hash, providerName, model, ttl)
 	}
 }
 

@@ -100,7 +100,23 @@ type RouteConfig struct {
 	FallbackRoutes []string `yaml:"fallback_routes"`
 	// PromptCacheAffinity pins cacheable prompt prefixes to the provider that
 	// served them (provider-side prompt cache hits); overrides global default.
+	// Shorthand for Affinity{Enabled: true} with prefix hashing.
 	PromptCacheAffinity bool `yaml:"prompt_cache_affinity"`
+	// Affinity (new-api channel affinity port): extended pin config. Wins
+	// over PromptCacheAffinity when enabled is set.
+	Affinity *AffinityConfig `yaml:"affinity"`
+}
+
+// AffinityConfig extends prompt-cache affinity: pin key source (header value
+// hash vs prompt-prefix hash), TTL, and skip_retry_on_failure (a pinned
+// request that fails must NOT fail over — state lives on that channel).
+type AffinityConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	KeyHeader string `yaml:"key_header"` // e.g. "X-Session-Id"; empty = prefix hashing
+	TTLMs     int    `yaml:"ttl_ms"`     // default 3600000
+	// SkipRetryOnFailure: on an affinity HIT, relay upstream failures to the
+	// client instead of failing over (stateful channel; new-api port).
+	SkipRetryOnFailure bool `yaml:"skip_retry_on_failure"`
 }
 
 // FreeTierConfig is one free-tier budget entry: provider+model gets

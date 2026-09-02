@@ -125,6 +125,14 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	for _, rc := range cfg.Routes {
 		rt := &router.Route{Model: rc.Model, Strategy: rc.Strategy, Multiplier: rc.Multiplier, FallbackRoutes: rc.FallbackRoutes,
 			PromptCacheAffinity: rc.PromptCacheAffinity}
+		if rc.Affinity != nil && rc.Affinity.Enabled {
+			rt.PromptCacheAffinity = true
+			rt.AffinityKeyHeader = rc.Affinity.KeyHeader
+			rt.AffinitySkipRetry = rc.Affinity.SkipRetryOnFailure
+			if rc.Affinity.TTLMs > 0 {
+				rt.AffinityTTL = time.Duration(rc.Affinity.TTLMs) * time.Millisecond
+			}
+		}
 		for _, cc := range rc.Candidates {
 			rt.Candidates = append(rt.Candidates, router.Candidate{
 				Provider:      byName[cc.Provider],
@@ -156,7 +164,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 		rt.SetAffinity(router.NewAffinityCache(time.Hour))
 	} else {
 		for _, rc := range cfg.Routes {
-			if rc.PromptCacheAffinity {
+			if rc.PromptCacheAffinity || (rc.Affinity != nil && rc.Affinity.Enabled) {
 				rt.SetAffinity(router.NewAffinityCache(time.Hour))
 				break
 			}
