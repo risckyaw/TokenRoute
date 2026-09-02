@@ -54,6 +54,41 @@ func TestExprPriceUnknownVarFailsLoad(t *testing.T) {
 	}
 }
 
+func TestRetryPolicyValid(t *testing.T) {
+	cfg := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: auto
+    candidates:
+      - {provider: p1, model: up}
+retry_policy:
+  retry_status_ranges: "100-199,300-399,401-407,409-499,500-503,505-599"
+  never_retry: [504, 524]
+  disable_status_ranges: "401"
+  disable_keywords: ["insufficient balance", "account suspended"]
+`
+	if _, err := Load(writeCfg(t, cfg)); err != nil {
+		t.Fatalf("valid retry_policy rejected: %v", err)
+	}
+}
+
+func TestRetryPolicyInvalidFailsLoad(t *testing.T) {
+	cfg := `
+providers:
+  - {name: p1, type: openai, base_url: http://x}
+routes:
+  - {model: auto, candidates: [{provider: p1, model: up}]}
+retry_policy:
+  retry_status_ranges: "abc"
+`
+	if _, err := Load(writeCfg(t, cfg)); err == nil {
+		t.Fatal("bad range must fail config load")
+	}
+}
+
 func replaceExpr(cfg, expr string) string {
 	out := ""
 	for _, line := range splitLines(cfg) {

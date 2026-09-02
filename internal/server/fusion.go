@@ -40,7 +40,7 @@ func (s *srv) fusionRun(ctx context.Context, hdr http.Header, body []byte, pair 
 			case err != nil:
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
 				results[i].err = err
-			case retryableStatus(att.StatusCode):
+			case s.retryableStatus(att.StatusCode):
 				errBody, _ := readClose(att)
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
 				if att.StatusCode == http.StatusTooManyRequests {

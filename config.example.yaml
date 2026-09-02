@@ -266,3 +266,19 @@ routes:
 
 # Global prompt-cache affinity default (per-route flag overrides).
 #prompt_cache_affinity: true
+
+# Retry/disable policy (new-api status_code_ranges + AutomaticDisableKeywords
+# port). UNSET = current hardcoded behavior exactly (retry 429/500/502/503/504,
+# 401/403 open the circuit fast). All fields optional within the block:
+# retry_status_ranges — comma-separated codes/ranges triggering failover;
+# never_retry — wins over ranges (504/524 recommended, they mean the upstream
+# gateway never got a response); disable_status_ranges — statuses classified
+# auth (instant circuit open); disable_keywords — case-insensitive body
+# substrings classifying a retryable failure as auth/quota: keywords
+# containing balance/credit/quota/insufficient become quota_exhausted (15min
+# model lock), others auth.
+#retry_policy:
+#  retry_status_ranges: "100-199,300-399,401-407,409-499,500-503,505-599"
+#  never_retry: [504, 524]
+#  disable_status_ranges: "401"
+#  disable_keywords: ["insufficient balance", "account suspended", "quota exceeded"]

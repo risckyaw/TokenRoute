@@ -9,6 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/Jarvisagentic/tokenroute/internal/pricing"
+	"github.com/Jarvisagentic/tokenroute/internal/router"
 )
 
 type CircuitConfig struct {
@@ -157,6 +158,19 @@ type Config struct {
 	// HealthCheck is the global background-probe default; a provider's own
 	// health_check block wins entirely.
 	HealthCheck *HealthCheckConfig `yaml:"health_check"`
+	// RetryPolicy overrides failover/disable classification (new-api port).
+	// Unset = current hardcoded behavior exactly.
+	RetryPolicy *RetryPolicyConfig `yaml:"retry_policy"`
+}
+
+// RetryPolicyConfig (new-api status_code_ranges + AutomaticDisableKeywords):
+// retry_status_ranges decides failover (never_retry wins), disable ranges +
+// keywords classify a failure as auth/quota so the circuit opens fast.
+type RetryPolicyConfig struct {
+	RetryStatusRanges   string   `yaml:"retry_status_ranges"`   // e.g. "100-199,300-399,401-407,409-499,500-503,505-599"
+	NeverRetry          []int    `yaml:"never_retry"`           // e.g. [504, 524]
+	DisableStatusRanges string   `yaml:"disable_status_ranges"` // e.g. "401"
+	DisableKeywords     []string `yaml:"disable_keywords"`      // case-insensitive body substrings
 }
 
 func Load(path string) (*Config, error) {
@@ -247,6 +261,11 @@ func (c *Config) Validate() error {
 			if _, _, err := pricing.Compile(p.Expr); err != nil {
 				return fmt.Errorf("prices %q: %w", m, err)
 			}
+		}
+	}
+	if rp := c.RetryPolicy; rp != nil {
+		if _, err := router.NewRetryPolicy(rp.RetryStatusRanges, rp.DisableStatusRanges, rp.NeverRetry, rp.DisableKeywords); err != nil {
+			return fmt.Errorf("retry_policy: %w", err)
 		}
 	}
 	return nil

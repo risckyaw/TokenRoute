@@ -82,6 +82,8 @@ type Options struct {
 	// ProviderTypes maps provider name -> configured type (openai|anthropic|
 	// gemini); expression pricing uses it for anthropic usage semantics.
 	ProviderTypes map[string]string
+	// RetryPolicy overrides failover/disable classification; nil = built-in.
+	RetryPolicy *router.RetryPolicy
 	// MaxBodyMB caps request bodies (0 = default 10MB).
 	MaxBodyMB int
 	// SearchBackends enables POST /v1/search when non-empty.
@@ -96,7 +98,7 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs, providerTypes: o.ProviderTypes,
+		streamIdleMs: o.StreamIdleMs, providerTypes: o.ProviderTypes, retryPolicy: o.RetryPolicy,
 		maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
 	mux := chi.NewRouter()
 	mux.Use(correlationID)
@@ -168,6 +170,8 @@ type srv struct {
 	streamIdleMs map[string]int
 	// providerTypes: provider name -> configured type (expr pricing semantics).
 	providerTypes map[string]string
+	// retryPolicy: configured failover/disable overrides (nil = built-in).
+	retryPolicy *router.RetryPolicy
 	maxBody      int64
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -562,10 +566,20 @@ func (s *srv) failoverCtx(ctx context.Context, hdr http.Header, body []byte, can
 			}
 			continue
 		}
-		if retryableStatus(att.StatusCode) {
+		if s.retryableStatus(att.StatusCode) {
 			errBody, _ := io.ReadAll(io.LimitReader(att.Body, 64<<10))
 			att.Body.Close()
 			f := router.ClassifyFailure(att.StatusCode, string(errBody), nil)
+			// Configured policy: disable keywords (new-api
+			// AutomaticDisableKeywords) reclassify to auth/quota so the
+			// circuit opens fast; disable_status_ranges force auth class.
+			if s.retryPolicy != nil {
+				if kind, ok := s.retryPolicy.ClassifyKeyword(string(errBody)); ok {
+					f = router.Failure{Kind: kind}
+				} else if s.retryPolicy.DisableStatus(att.StatusCode) {
+					f = router.Failure{Kind: router.FailureAuth}
+				}
+			}
 			s.router.RecordResultKind(c.Provider.Name(), time.Since(attemptStart), false, f.Kind, true)
 			if att.StatusCode == http.StatusTooManyRequests {
 				// Quota-aware lock: honor the upstream-signalled reset
@@ -1026,7 +1040,16 @@ func parseRetryAfter(v string) time.Duration {
 	return 0
 }
 
-// retryableStatus marks upstream statuses that trigger failover.
+// retryableStatus marks upstream statuses that trigger failover: the
+// configured policy when set, else the built-in 429/500/502/503/504.
+func (s *srv) retryableStatus(code int) bool {
+	if s.retryPolicy != nil {
+		return s.retryPolicy.Retryable(code)
+	}
+	return retryableStatus(code)
+}
+
+// retryableStatus is the built-in failover set (no policy configured).
 func retryableStatus(code int) bool {
 	switch code {
 	case http.StatusTooManyRequests, http.StatusInternalServerError,

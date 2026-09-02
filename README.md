@@ -81,6 +81,12 @@ speak one API.
   transport errors fall through to the next candidate; per-provider
   breakers with half-open probes; 429 `Retry-After` opens the breaker for
   the hinted duration; 429/404 lock out that provider+model for 30s.
+- **Configurable retry/disable policy** — optional `retry_policy:` (new-api
+  port): `retry_status_ranges` + `never_retry` decide failover,
+  `disable_status_ranges` + `disable_keywords` (case-insensitive body
+  match; balance/credit/quota/insufficient wording → quota_exhausted 15min
+  lock, else auth-class instant circuit open). Unset = built-in behavior
+  exactly.
 - **Observability headers** — every chat response carries
   `X-TokenRoute-Decision` (provider/model/strategy/attempts); non-stream
   200s also carry token counts and `X-TokenRoute-Cost-USD` when priced.
@@ -230,6 +236,7 @@ gateway-local (never forwarded upstream).
 | `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering) |
 | `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |
 | `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
+| `retry_policy` | Optional `{retry_status_ranges, never_retry, disable_status_ranges, disable_keywords}` failover/disable overrides (unset = built-in) |
 
 Provider types:
 

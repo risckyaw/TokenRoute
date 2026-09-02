@@ -48,6 +48,8 @@ type serverState struct {
 	streamIdleMs map[string]int
 	// providerTypes: provider name -> configured type (expr pricing semantics).
 	providerTypes map[string]string
+	// retryPolicy: configured failover/disable overrides (nil = built-in).
+	retryPolicy *router.RetryPolicy
 	maxBodyMB    int
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -215,7 +217,16 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			return nil, fmt.Errorf("unknown search backend %q", sc.Backend)
 		}
 	}
-	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
+	var rp *router.RetryPolicy
+	if cfg.RetryPolicy != nil {
+		var err error
+		rp, err = router.NewRetryPolicy(cfg.RetryPolicy.RetryStatusRanges, cfg.RetryPolicy.DisableStatusRanges,
+			cfg.RetryPolicy.NeverRetry, cfg.RetryPolicy.DisableKeywords)
+		if err != nil {
+			return nil, fmt.Errorf("retry_policy: %w", err)
+		}
+	}
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, retryPolicy: rp, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 
 // healthTargets resolves per-provider probe targets: a provider's own
@@ -353,6 +364,7 @@ func main() {
 			SeparateAdmin:  cfg.AdminListen != "",
 			StreamIdleMs:   st.streamIdleMs,
 			ProviderTypes:  st.providerTypes,
+			RetryPolicy:    st.retryPolicy,
 			MaxBodyMB:      st.maxBodyMB,
 			SearchBackends: st.searchBackends,
 		}).ServeHTTP(w, r)
