@@ -29,6 +29,7 @@ const (
 	StrategyAuto         = "auto"        // composite multi-factor scoring (OmniRoute port)
 	StrategyLowestUsage  = "lowest_usage" // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
 	StrategyPeakEWMA     = "peak_ewma"   // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
+	StrategyLeastConn    = "least_connections" // fewest in-flight upstream requests first (Kong)
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -37,7 +38,7 @@ func ValidStrategy(s string) bool {
 	case StrategyPriority, StrategyRoundRobin, StrategyLeastLatency,
 		StrategyWeighted, StrategyCost, StrategyLKGP, StrategyHeadroom, StrategyFusion,
 		StrategyP2C, StrategyResetAware, StrategyFillFirst, StrategyAuto, StrategyLowestUsage,
-		StrategyPeakEWMA:
+		StrategyPeakEWMA, StrategyLeastConn:
 		return true
 	}
 	return false
@@ -119,6 +120,7 @@ type Router struct {
 	lockMu    sync.Mutex
 	modelLock map[string]time.Time // provider|model -> locked until
 	windows   map[string]*window   // provider name -> 60s tumbling counters
+	inflight  map[string]int       // provider name -> live upstream requests (least_connections)
 	quota     *QuotaLedger         // pre-request budget awareness (nil-safe)
 	aliases   map[string]string    // client model name -> virtual route model
 	affinity  *AffinityCache       // prompt-prefix pinning (nil = disabled)
@@ -216,6 +218,7 @@ func New(providers []provider.Provider, routes []*Route) *Router {
 		errRate:   map[string]float64{},
 		modelLock: map[string]time.Time{},
 		windows:   map[string]*window{},
+		inflight:  map[string]int{},
 		quota:     NewQuotaLedger(),
 	}
 	for _, rt := range routes {
@@ -523,6 +526,25 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 				allowed = append([]Candidate{winner, loser}, rest...)
 			}
 		}
+	case StrategyLeastConn:
+		// Kong least_connections: (inflight+1)/weight ascending; ties keep
+		// priority order. Unseen (0 inflight) naturally leads at equal weight.
+		r.latMu.Lock()
+		counts := make(map[string]int, len(r.inflight))
+		for name, n := range r.inflight {
+			counts[name] = n
+		}
+		r.latMu.Unlock()
+		score := func(c Candidate) float64 {
+			w := c.Weight
+			if w <= 0 {
+				w = 1
+			}
+			return float64(counts[c.Provider.Name()]+1) / float64(w)
+		}
+		sort.SliceStable(allowed, func(i, j int) bool {
+			return score(allowed[i]) < score(allowed[j])
+		})
 	case StrategyResetAware:
 		// Prefer candidates whose quota window resets soonest; unknown quota
 		// sorts last (no signal). Ties keep priority order.
@@ -559,11 +581,18 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 		// Composite multi-factor score, ported from OmniRoute
 		// adaptiveRouting.ts: product of clamped 0..1 factors so a single
 		// zero disqualifies. Factors: health (1 - errRate), latency, cost,
-		// quota headroom. Circuit open / model lock already filtered above.
+		// quota headroom, live inflight load (Kong least_connections signal,
+		// modest weight: inflightF = 1/(1+inflight), floored at 0.5 so an
+		// idle-but-slow provider still outranks a busy fast one only via
+		// other factors). Circuit open / model lock already filtered above.
 		r.latMu.Lock()
 		errs := make(map[string]float64, len(r.errRate))
 		for k, v := range r.errRate {
 			errs[k] = v
+		}
+		loads := make(map[string]int, len(r.inflight))
+		for k, v := range r.inflight {
+			loads[k] = v
 		}
 		r.latMu.Unlock()
 		lat, seed, hasLat := r.latencySnapshot()
@@ -595,7 +624,10 @@ func (r *Router) OrderCandidatesTagged(rt *Route, sel *TagSelector) []Candidate 
 					quotaF = 0
 				}
 			}
-			score := health * latencyF * costF * quotaF
+			// Inflight load, ~15% effective weight: 1/(1+n) compressed to
+			// [0.5, 1] so load alone never zeroes a candidate.
+			inflightF := 0.5 + 0.5/(1+float64(loads[name]))
+			score := health * latencyF * costF * quotaF * inflightF
 			scores = append(scores, scored{c, score})
 		}
 		sort.SliceStable(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
@@ -822,6 +854,29 @@ func (r *Router) LatencyMs(providerName string) float64 {
 	defer r.latMu.Unlock()
 	v, _ := r.decayedEWMA(providerName, time.Now())
 	return v
+}
+
+// IncInflight marks one live upstream request for the provider.
+func (r *Router) IncInflight(providerName string) {
+	r.latMu.Lock()
+	r.inflight[providerName]++
+	r.latMu.Unlock()
+}
+
+// DecInflight clears one live upstream request (floored at 0).
+func (r *Router) DecInflight(providerName string) {
+	r.latMu.Lock()
+	if r.inflight[providerName] > 0 {
+		r.inflight[providerName]--
+	}
+	r.latMu.Unlock()
+}
+
+// Inflight returns the provider's live upstream request count.
+func (r *Router) Inflight(providerName string) int {
+	r.latMu.Lock()
+	defer r.latMu.Unlock()
+	return r.inflight[providerName]
 }
 
 // WindowReqs returns the provider's request count in the current 60s window

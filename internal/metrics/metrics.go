@@ -118,7 +118,9 @@ type Registry struct {
 	latency   histogram
 	// CircuitOpen reports 1 when the provider's circuit is open (read at scrape).
 	CircuitOpen func(provider string) bool
-	Providers   func() []string
+	// Inflight reports the provider's live upstream request count (read at scrape).
+	Inflight  func(provider string) int
+	Providers func() []string
 }
 
 func New() *Registry { return &Registry{} }
@@ -160,6 +162,12 @@ func (r *Registry) Write(w io.Writer) {
 				v = 1
 			}
 			fmt.Fprintf(w, "tokenroute_circuit_open{provider=%q} %d\n", p, v)
+		}
+	}
+	fmt.Fprint(w, "# HELP tokenroute_inflight Live upstream requests per provider.\n# TYPE tokenroute_inflight gauge\n")
+	if r.Providers != nil && r.Inflight != nil {
+		for _, p := range r.Providers() {
+			fmt.Fprintf(w, "tokenroute_inflight{provider=%q} %d\n", p, r.Inflight(p))
 		}
 	}
 }

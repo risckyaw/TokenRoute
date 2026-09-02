@@ -191,6 +191,7 @@ curl -N localhost:8400/v1/chat/completions \
 | `cost`         | Lowest prompt+completion price first; unpriced last  | Cost optimization |
 | `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
 | `headroom`     | Fewest requests in the last 60s first; ties -> priority | Load-aware spreading |
+| `least_connections` | Fewest live in-flight upstream requests first, scored (inflight+1)/weight; ties -> priority | Long-running SSE streams; true live load (Kong) |
 | `lowest_usage` | Fewest observed tokens in the current minute first; unseen first, ties -> priority | Token-budget-aware spreading |
 
 Latency EWMA now decays lazily with a 10s time constant (Kong
@@ -229,7 +230,8 @@ never rejected.
 admin listeners (no auth): `tokenroute_requests_total{key,provider,model,
 status_class}`, `tokenroute_tokens_total{key,provider,kind}`,
 `tokenroute_cache_hits_total`, `tokenroute_latency_seconds{provider}`
-histogram, `tokenroute_circuit_open{provider}` gauge.
+histogram, `tokenroute_circuit_open{provider}` gauge,
+`tokenroute_inflight{provider}` gauge (live upstream requests).
 
 ## Per-request timeout
 

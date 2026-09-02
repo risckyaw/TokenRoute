@@ -595,9 +595,11 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 		}
 		attemptStart := time.Now()
 		req := &provider.Request{Model: cand.Model, Body: reqBody, Header: reqHdr}
+		s.router.IncInflight(c.Provider.Name())
 		att, err := call(ctx, c.Provider, req)
 		attempts++
 		if err != nil {
+			s.router.DecInflight(c.Provider.Name())
 			// Classify transport errors: client aborts must not count against
 			// the provider's circuit breaker (OmniRoute
 			// isLocalStreamLifecycleError).
@@ -616,6 +618,7 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 		if s.retryableStatus(att.StatusCode) {
 			errBody, _ := io.ReadAll(io.LimitReader(att.Body, 64<<10))
 			att.Body.Close()
+			s.router.DecInflight(c.Provider.Name())
 			f := router.ClassifyFailure(att.StatusCode, string(errBody), nil)
 			// Configured policy: disable keywords (new-api
 			// AutomaticDisableKeywords) reclassify to auth/quota so the
@@ -667,6 +670,11 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 		}
 		// Deterministic answer: 2xx success, other 4xx reachable — no failover.
 		s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), true)
+		// Inflight stays counted until the relayed body is fully read/closed
+		// (covers both buffered and SSE streaming relays).
+		att.Body = &inflightBody{ReadCloser: att.Body, done: func() {
+			s.router.DecInflight(c.Provider.Name())
+		}}
 		resp = att
 		break
 	}
@@ -1250,6 +1258,22 @@ func (s *srv) logEntry(ctx context.Context, e usage.Entry) {
 		attrs = append(attrs, "budget_exceeded", true)
 	}
 	slog.Info("request", attrs...)
+}
+
+// inflightBody decrements the provider's inflight counter on Close
+// (once). The gateway always closes relayed bodies exactly once.
+type inflightBody struct {
+	io.ReadCloser
+	done func()
+}
+
+func (b *inflightBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.done != nil {
+		b.done()
+		b.done = nil
+	}
+	return err
 }
 
 // relayFull buffers the whole upstream body (non-stream), extracts usage,

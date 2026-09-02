@@ -297,6 +297,7 @@ func bindMetrics(m *metrics.Registry, rt *router.Router) {
 		return names
 	}
 	m.CircuitOpen = func(name string) bool { return rt.CircuitState(name) == "open" }
+	m.Inflight = func(name string) int { return rt.Inflight(name) }
 }
 
 func main() {

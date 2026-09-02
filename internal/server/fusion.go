@@ -35,16 +35,19 @@ func (s *srv) fusionRun(ctx context.Context, hdr http.Header, body []byte, pair 
 			defer wg.Done()
 			attemptStart := time.Now()
 			req := &provider.Request{Model: c.Model, Body: body, Header: hdr}
+			s.router.IncInflight(c.Provider.Name())
 			att, err := c.Provider.ChatComplete(ctx, req)
 			if err == nil {
 				s.observeUpstreamQuota(c.Provider.Name(), c.Model, att.Header)
 			}
 			switch {
 			case err != nil:
+				s.router.DecInflight(c.Provider.Name())
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
 				results[i].err = err
 			case s.retryableStatus(att.StatusCode):
 				errBody, _ := readClose(att)
+				s.router.DecInflight(c.Provider.Name())
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), false)
 				if att.StatusCode == http.StatusTooManyRequests {
 					s.router.LockModel(c.Provider.Name(), c.Model, 30*time.Second)
@@ -61,6 +64,11 @@ func (s *srv) fusionRun(ctx context.Context, hdr http.Header, body []byte, pair 
 					s.router.LockModel(c.Provider.Name(), c.Model, 30*time.Second)
 				}
 				s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), true)
+				// Inflight clears when the body closes (winner: after relay;
+				// loser: discarded below).
+				att.Body = &inflightBody{ReadCloser: att.Body, done: func() {
+					s.router.DecInflight(c.Provider.Name())
+				}}
 				results[i].resp = att
 			}
 			results[i].cand = c
