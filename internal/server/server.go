@@ -427,10 +427,7 @@ func (s *srv) prepareRequest(w http.ResponseWriter, r *http.Request) (body []byt
 	if rt := s.router.Resolve(model); rt != nil {
 		// Tag-based routing (LiteLLM tag_based_routing): X-Route-Tags header,
 		// comma-separated; plain = subset match, !tag excludes, &tag requires.
-		if sel := router.ParseTagSelector(r.Header.Get("X-Route-Tags")); sel != nil {
-			rt = rt.WithTags(sel)
-		}
-		candidates = s.router.OrderCandidates(rt)
+		candidates = s.router.OrderCandidatesTagged(rt, router.ParseTagSelector(r.Header.Get("X-Route-Tags")))
 		strategy = rt.Strategy
 		mult = rt.Multiplier
 	} else {
@@ -631,10 +628,7 @@ func (s *srv) runRoute(ctx context.Context, hdr http.Header, body []byte, model 
 		if next == nil {
 			return cand, resp, lastFailResp, lastErr, attempts, fused, pinned
 		}
-		if sel != nil {
-			next = next.WithTags(sel)
-		}
-		candidates = s.router.OrderCandidates(next)
+		candidates = s.router.OrderCandidatesTagged(next, sel)
 		if len(candidates) == 0 {
 			cur = next // skip routes with no usable candidates
 			continue

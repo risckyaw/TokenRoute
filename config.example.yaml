@@ -27,6 +27,23 @@ providers:
     # auto_disable_after: after N open-transitions the provider is disabled
     # until POST /admin/providers/{name}/enable (default 3; 0 = default).
     circuit: {failure_threshold: 3, cooldown_ms: 30000, auto_disable_after: 3}
+    # Percent mode (LiteLLM): trip when failures in the current minute >=
+    # max(min_requests, failure_percent * total_minute_requests). Default mode
+    # is "consecutive" (above). Example:
+    # circuit: {mode: percent, failure_percent: 0.5, min_requests: 5, cooldown_ms: 30000}
+    # Per-exception budgets (LiteLLM allowed_fails): consecutive failures of a
+    # kind tolerated before opening (trips at N+1). Kinds not listed use the
+    # global threshold; auth/permission stay instant-open unless listed.
+    # Kind names: auth, permission, rate_limit, quota_exhausted, timeout,
+    # server, invalid_request, model_unavailable, network, unknown.
+    # circuit: {failure_threshold: 3, cooldown_ms: 30000,
+    #           allowed_fails: {timeout: 10, rate_limit: 3, server: 5, quota_exhausted: 1}}
+    # Background health check (default disabled): minimal probe
+    # (max_tokens=1, "hi") on an interval, feeding circuit state and latency
+    # EMA so they stay warm before user traffic. Never writes usage rows or
+    # touches the quota ledger. Global default via top-level health_check:;
+    # this per-provider block wins.
+    #health_check: {enabled: true, interval_ms: 60000, model: gpt-4o-mini}
     # Bounds ONLY the wait for upstream response headers (default 15min).
     # Streaming after headers arrive is unaffected. 0 = default.
     #response_header_timeout_ms: 900000
@@ -74,7 +91,10 @@ providers:
 routes:
   # Virtual model names clients use in "model" field.
   # strategy: priority (default) | round_robin | least_latency | weighted | cost |
-  #           lkgp | headroom | fusion | p2c | reset_aware | fill_first | auto
+  #           lkgp | headroom | fusion | p2c | reset_aware | fill_first | auto |
+  #           lowest_usage
+  # lowest_usage: fewest observed tokens in the current minute first (LiteLLM
+  #              lowest_tpm_rpm_v2); unseen candidates first, ties by priority.
   # p2c:         power-of-2-choices — 2 random candidates, least-loaded first.
   # reset_aware: candidates whose quota window resets soonest first.
   # fill_first:  keep priority order; sink quota-exhausted candidates (pairs
@@ -93,12 +113,26 @@ routes:
     strategy: priority              # first candidate by priority; failover on retryable errors
     # multiplier scales the logged USD cost for this route (default 1.0).
     #multiplier: 1.0
+    # fallback_routes (LiteLLM fallbacks): other virtual models tried, in
+    # order, when EVERY candidate here fails retryably (max 3 route hops,
+    # cycles skipped). Client errors (400/401/403) never trigger it.
+    #fallback_routes: [cheap]
+    # prompt_cache_affinity: pin requests with a cacheable prompt prefix to
+    # the provider+model that served it (1h TTL) so provider-side prompt
+    # caches hit; X-TokenRoute-Decision gains ;affinity=hit on a pin hit.
+    # Global default: top-level prompt_cache_affinity: true (default false).
+    #prompt_cache_affinity: true
     candidates:
       - provider: deepseek
         model: deepseek-chat
         # Optional group tags; keys with groups: ["team-x"] only reach
         # candidates sharing a group (empty on either side = wildcard).
         #groups: [team-x]
+        # Tag-based routing labels: clients send X-Route-Tags: vision,cheap
+        # (comma-separated; !tag excludes, &tag requires). Plain request tags
+        # must be a subset of the candidate's tags; empty candidate tags match
+        # everything except &requirements.
+        #tags: [vision, us]
       - provider: openai
         model: gpt-4o-mini
 
@@ -211,3 +245,9 @@ routes:
 #    api_keys: [$BRAVE_KEY_A, $BRAVE_KEY_B]
 #  - backend: exa
 #    api_key: $EXA_API_KEY
+
+# Global background health-check default (per-provider health_check: wins).
+#health_check: {enabled: true, interval_ms: 60000}
+
+# Global prompt-cache affinity default (per-route flag overrides).
+#prompt_cache_affinity: true

@@ -66,26 +66,22 @@ func TestOrderCandidatesTagFilter(t *testing.T) {
 		t.Fatalf("no selector: %d candidates, want 2", len(got))
 	}
 	// Subset: only the tagged candidate survives.
-	got := r.OrderCandidates(rt.WithTags(ParseTagSelector("vision")))
+	got := r.OrderCandidatesTagged(rt, ParseTagSelector("vision"))
 	if len(got) != 1 || got[0].Provider.Name() != "hi" {
 		t.Fatalf("vision: %v", got)
 	}
 	// Exclusion drops the tagged one, lower-priority wins.
-	got = r.OrderCandidates(rt.WithTags(ParseTagSelector("!vision")))
+	got = r.OrderCandidatesTagged(rt, ParseTagSelector("!vision"))
 	if len(got) != 1 || got[0].Provider.Name() != "lo" {
 		t.Fatalf("!vision: %v", got)
 	}
 	// Requirement satisfied by candidate tags.
-	got = r.OrderCandidates(rt.WithTags(ParseTagSelector("&cheap")))
+	got = r.OrderCandidatesTagged(rt, ParseTagSelector("&cheap"))
 	if len(got) != 1 || got[0].Provider.Name() != "lo" {
 		t.Fatalf("&cheap: %v", got)
 	}
 	// Requirement no candidate satisfies: empty.
-	if got := r.OrderCandidates(rt.WithTags(ParseTagSelector("&us"))); len(got) != 0 {
+	if got := r.OrderCandidatesTagged(rt, ParseTagSelector("&us")); len(got) != 0 {
 		t.Fatalf("&us: %v, want empty", got)
-	}
-	// WithTags on nil selector returns the same route.
-	if rt.WithTags(nil) != rt {
-		t.Fatal("WithTags(nil) must return the original route")
 	}
 }

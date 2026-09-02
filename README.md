@@ -16,8 +16,32 @@ speak one API.
   last 60s first), fusion (race first two candidates, fastest/cheapest 200
   wins), p2c (power-of-2-choices), reset_aware (quota window resetting
   soonest first), fill_first (exhaust one candidate's quota before the
-  next), auto (composite score: health × latency × cost × quota headroom) —
-  per virtual model.
+  next), auto (composite score: health × latency × cost × quota headroom),
+  lowest_usage (fewest tokens in the current minute first) — per virtual
+  model.
+- **Percent circuit threshold** — optional `circuit: {mode: percent,
+  failure_percent, min_requests}` trips on a failure ratio in the current
+  minute instead of consecutive failures (LiteLLM semantics).
+- **Per-exception failure budgets** — `circuit: {allowed_fails: {timeout: 10,
+  rate_limit: 3, ...}}` tolerates N consecutive failures per kind before
+  opening; unlisted kinds keep the global threshold, auth/permission stay
+  instant-open unless listed.
+- **Tag-based routing** — candidates carry `tags`; clients send
+  `X-Route-Tags: vision,cheap,!beta,&us` (plain = subset match, `!`
+  excludes, `&` requires) to filter candidates per request.
+- **Cross-model fallback** — `fallback_routes: [other-model]` on a route
+  tries another virtual model's candidates when every candidate of the
+  route fails retryably (max 3 route hops, cycle-safe; client errors never
+  trigger it).
+- **Prompt-cache affinity** — `prompt_cache_affinity: true` (global or per
+  route) pins a cacheable prompt prefix (explicit `cache_control`, or
+  system+first-user ≥ 1024 bytes) to the provider+model that served it for
+  1h, so provider-side prompt caches hit; decision header gains
+  `;affinity=hit`.
+- **Background health checks** — `health_check: {enabled, interval_ms,
+  model}` per provider (or global) probes with a minimal completion so
+  circuit state and latency EMA stay warm; never touches usage log or quota
+  ledger.
 - **Failure classification** — 429s carrying balance/credit wording are
   quota_exhausted (15min model lock), not rate limits; 401/403 open the
   circuit immediately; client aborts never count as provider failures.
@@ -134,6 +158,7 @@ curl -N localhost:8400/v1/chat/completions \
 | `cost`         | Lowest prompt+completion price first; unpriced last  | Cost optimization |
 | `lkgp`         | Last successfully serving provider first; failure reverts to priority | Sticky good-provider preference |
 | `headroom`     | Fewest requests in the last 60s first; ties -> priority | Load-aware spreading |
+| `lowest_usage` | Fewest observed tokens in the current minute first; unseen first, ties -> priority | Token-budget-aware spreading |
 
 Failover applies to all strategies: 429/500/502/503/504 and transport
 errors try the next candidate (each tried at most once per request). Other
@@ -172,6 +197,15 @@ histogram, `tokenroute_circuit_open{provider}` gauge.
 that request only (capped at 600000 ms). Exceeding it fails over like a
 transport error (502 when all candidates time out).
 
+## Tag-based routing
+
+Label route candidates with `tags: [vision, us]`, then send
+`X-Route-Tags: vision,!beta,&us` on a request (comma-separated): plain tags
+must be a subset of the candidate's tags, `!tag` excludes candidates
+carrying it, `&tag` requires it. Empty candidate tags match everything
+except `&` requirements; no header = all candidates pass. The header is
+gateway-local (never forwarded upstream).
+
 ## Configuration
 
 `config.yaml` — secrets only via `${ENV_VAR}` placeholders:
@@ -183,8 +217,10 @@ transport error (502 when all candidates time out).
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
 | `max_body_mb` | Max request body size in MB, default 10 |
 | `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard |
-| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin) |
-| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), ordered `candidates` (`provider`, upstream `model`, optional `weight`) |
+| `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled) |
+| `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering) |
+| `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |
+| `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
 
 Provider types:
 
