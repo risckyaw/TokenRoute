@@ -46,6 +46,8 @@ type serverState struct {
 	metrics  *metrics.Registry
 	// streamIdleMs is the per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
+	// providerTypes: provider name -> configured type (expr pricing semantics).
+	providerTypes map[string]string
 	maxBodyMB    int
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -58,6 +60,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	provs := make([]provider.Provider, 0, len(cfg.Providers))
 	byName := map[string]provider.Provider{}
 	sit := map[string]int{} // stream idle timeout ms per provider name
+	ptypes := map[string]string{}
 	mappings := map[string]map[string]string{}
 	for _, pc := range cfg.Providers {
 		// ponytail: 0 means "unset" here, so an explicit 0 in YAML also gets
@@ -72,6 +75,10 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			sitMs = 300000 // 5min default
 		}
 		sit[pc.Name], mappings[pc.Name] = sitMs, pc.ModelMapping
+		ptypes[pc.Name] = pc.Type
+		if ptypes[pc.Name] == "" {
+			ptypes[pc.Name] = "openai"
+		}
 		var p provider.Provider
 		switch pc.Type {
 		case "openai", "":
@@ -133,7 +140,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	// synced entries (OmniRoute resolution order). Config entries removed
 	// from YAML linger until restart — acceptable last-good semantics.
 	for m, pc := range cfg.Prices {
-		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens}
+		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens, Expr: pc.Expr}
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
@@ -208,7 +215,7 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			return nil, fmt.Errorf("unknown search backend %q", sc.Backend)
 		}
 	}
-	return &serverState{router: rt, prices: prices, streamIdleMs: sit, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
+	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 
 // healthTargets resolves per-provider probe targets: a provider's own
@@ -345,6 +352,7 @@ func main() {
 			Metrics:        st.metrics,
 			SeparateAdmin:  cfg.AdminListen != "",
 			StreamIdleMs:   st.streamIdleMs,
+			ProviderTypes:  st.providerTypes,
 			MaxBodyMB:      st.maxBodyMB,
 			SearchBackends: st.searchBackends,
 		}).ServeHTTP(w, r)

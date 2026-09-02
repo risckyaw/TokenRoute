@@ -182,8 +182,10 @@ type antResponse struct {
 	} `json:"content"`
 	StopReason string `json:"stop_reason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -199,6 +201,17 @@ func translateResponse(body []byte) ([]byte, error) {
 		}
 	}
 	total := ar.Usage.InputTokens + ar.Usage.OutputTokens
+	usage := map[string]any{
+		"prompt_tokens":     ar.Usage.InputTokens,
+		"completion_tokens": ar.Usage.OutputTokens,
+		"total_tokens":      total,
+	}
+	if ar.Usage.CacheCreationInputTokens > 0 {
+		usage["cache_creation_input_tokens"] = ar.Usage.CacheCreationInputTokens
+	}
+	if ar.Usage.CacheReadInputTokens > 0 {
+		usage["cache_read_input_tokens"] = ar.Usage.CacheReadInputTokens
+	}
 	out := map[string]any{
 		"id":      ar.ID,
 		"object":  "chat.completion",
@@ -209,11 +222,7 @@ func translateResponse(body []byte) ([]byte, error) {
 			"message":       map[string]any{"role": "assistant", "content": sb.String()},
 			"finish_reason": mapFinishReason(ar.StopReason),
 		}},
-		"usage": map[string]any{
-			"prompt_tokens":     ar.Usage.InputTokens,
-			"completion_tokens": ar.Usage.OutputTokens,
-			"total_tokens":      total,
-		},
+		"usage": usage,
 	}
 	return json.Marshal(out)
 }
@@ -231,6 +240,8 @@ type streamTranslator struct {
 	created      int64
 	inputTokens  int
 	outputTokens int
+	cacheCreate  int
+	cacheRead    int
 	sentRole     bool
 	finish       string
 	done         bool
@@ -265,14 +276,21 @@ func (t *streamTranslator) emitChunk(delta map[string]any, finish *string) {
 }
 
 func (t *streamTranslator) emitUsageAndDone() {
+	usage := map[string]any{
+		"prompt_tokens":     t.inputTokens,
+		"completion_tokens": t.outputTokens,
+		"total_tokens":      t.inputTokens + t.outputTokens,
+	}
+	if t.cacheCreate > 0 {
+		usage["cache_creation_input_tokens"] = t.cacheCreate
+	}
+	if t.cacheRead > 0 {
+		usage["cache_read_input_tokens"] = t.cacheRead
+	}
 	ch := map[string]any{
 		"id": t.id, "object": "chat.completion.chunk", "created": t.created,
 		"model": t.model, "choices": []any{},
-		"usage": map[string]any{
-			"prompt_tokens":     t.inputTokens,
-			"completion_tokens": t.outputTokens,
-			"total_tokens":      t.inputTokens + t.outputTokens,
-		},
+		"usage": usage,
 	}
 	b, _ := json.Marshal(ch)
 	t.out.WriteString("data: ")
@@ -302,6 +320,8 @@ func (t *streamTranslator) dispatch() {
 			}
 			if u, _ := msg["usage"].(map[string]any); u != nil {
 				t.inputTokens = num(u["input_tokens"])
+				t.cacheCreate = num(u["cache_creation_input_tokens"])
+				t.cacheRead = num(u["cache_read_input_tokens"])
 			}
 		}
 		if !t.sentRole {
@@ -324,6 +344,12 @@ func (t *streamTranslator) dispatch() {
 	case "message_delta":
 		if u, _ := ev["usage"].(map[string]any); u != nil {
 			t.outputTokens = num(u["output_tokens"])
+			if v := num(u["cache_creation_input_tokens"]); v > t.cacheCreate {
+				t.cacheCreate = v
+			}
+			if v := num(u["cache_read_input_tokens"]); v > t.cacheRead {
+				t.cacheRead = v
+			}
 		}
 		if delta, _ := ev["delta"].(map[string]any); delta != nil {
 			if sr, _ := delta["stop_reason"].(string); sr != "" {

@@ -13,6 +13,21 @@ prices:
   deepseek-chat: {prompt_per_1m: 0.14, completion_per_1m: 0.28, context_tokens: 64000}
   gpt-4o-mini:   {prompt_per_1m: 0.15, completion_per_1m: 0.60, context_tokens: 128000}
   gpt-4o:        {prompt_per_1m: 2.50, completion_per_1m: 10.00, context_tokens: 128000}
+  # expr (new-api billingexpr port): one expression per model evaluated per
+  # request; WINS over the flat fields entirely for chat cost. Variables:
+  # p (billable prompt tokens), c (completion), len (total input incl. cache
+  # tokens, for tier conditions), cr (cached-read), cc (cache-creation),
+  # cc1h (1h-TTL cache creation), img (image in), ai (audio in), ao (audio
+  # out). Coefficients are USD per 1M tokens; the result is auto-divided by
+  # 1e6. tier(name, cost) records the matched tier in the usage log
+  # (price_tier column). [OI] semantics: cr/cc/img/ai are subtracted from p
+  # ONLY when the expression references them; anthropic providers report
+  # input_tokens text-only so nothing is subtracted (len = p+cr+cc instead).
+  # Invalid expressions fail config load. Cached-token pricing needs no
+  # separate knob — price cr explicitly: 'p*2 + c*8 + cr*0.2'.
+  #claude-sonnet:
+  #  expr: 'p <= 200000 ? tier("standard", p*3.0 + c*15.0) : tier("long_context", p*6.0 + c*22.5)'
+  #  context_tokens: 200000
 
 providers:
   # Secrets via env vars only — never commit real keys.

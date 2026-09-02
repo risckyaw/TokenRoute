@@ -86,6 +86,15 @@ speak one API.
   200s also carry token counts and `X-TokenRoute-Cost-USD` when priced.
 - **Usage logging + pricing** — SQLite log with tokens per request, SSE
   token tracking, per-model USD pricing.
+- **Expression pricing** — `prices: {model: {expr: "..."}}` (new-api
+  billingexpr port): one expression per model with variables `p`, `c`, `len`,
+  `cr`, `cc`, `cc1h`, `img`, `ai`, `ao` (coefficients = USD/1M, result
+  auto-divided by 1e6); `tier(name, cost)` records the tier in the usage log
+  (`price_tier` column). Wins over flat rates for chat cost; invalid
+  expressions fail config load. Cached-token pricing needs no separate knob —
+  price `cr` explicitly: `p*2 + c*8 + cr*0.2`. [OI] semantics subtract
+  referenced detail tokens from `p`; anthropic providers (text-only
+  `input_tokens`) skip subtraction and get `len = p+cr+cc`.
 - **Virtual API keys** — per-key RPM/TPM token buckets, lifetime quotas,
   model allowlists, expiry; full admin API. Rate limits surfaced via
   `RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset` (RPM) and
@@ -216,7 +225,7 @@ gateway-local (never forwarded upstream).
 | `usage_db` | SQLite path (usage logs + API keys), default `data/usage.db` |
 | `admin_key` | Admin API key (`${GATEWAY_ADMIN_KEY}`); empty disables `/admin` |
 | `max_body_mb` | Max request body size in MB, default 10 |
-| `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard |
+| `prices` | Map of upstream model → `{prompt_per_1m, completion_per_1m, embed_per_1m, context_tokens}` USD per 1M tokens; `context_tokens` enables the context-window guard; optional `expr` (expression pricing, see Features) wins over flat rates for chat cost |
 | `providers[]` | `name`, `type` (`openai`/`anthropic`/`gemini`), `base_url`, `api_key` (`${VAR}`, may be empty e.g. Ollama), optional `api_keys` pool (`${VAR}` each; round-robin, 60s cooldown on 401/429), `priority` (lower = preferred), `timeout_ms`, optional `circuit: {failure_threshold, cooldown_ms, auto_disable_after}` (defaults 3/30000/3; after N circuit trips the provider is disabled until re-enabled via admin; also `mode: percent` + `failure_percent`/`min_requests`, and `allowed_fails: {kind: n}` per-exception budgets), optional `health_check: {enabled, interval_ms, model}` (background probes; default disabled) |
 | `routes[]` | Virtual `model`, optional `strategy`, optional `multiplier` (cost multiplier, default 1.0), optional `fallback_routes` (other virtual models tried when all candidates fail retryably), optional `prompt_cache_affinity` (pin cacheable prefixes to the serving provider, 1h), ordered `candidates` (`provider`, upstream `model`, optional `weight`, optional `groups`, optional `tags` for `X-Route-Tags` filtering) |
 | `prompt_cache_affinity` | Global default for per-route prefix pinning, default false |

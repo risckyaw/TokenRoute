@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Jarvisagentic/tokenroute/internal/pricing"
 )
 
 type CircuitConfig struct {
@@ -101,6 +103,11 @@ type PriceConfig struct {
 	CompletionPer1M float64 `yaml:"completion_per_1m"`
 	EmbedPer1M      float64 `yaml:"embed_per_1m"`   // optional; falls back to prompt_per_1m
 	ContextTokens   int     `yaml:"context_tokens"` // optional; 0 = no context guard
+	// Expr (new-api billingexpr port): one expression evaluated per request
+	// with token variables p,c,len,cr,cc,cc1h,img,ai,ao; coefficients are USD
+	// per 1M tokens and the result is auto-divided by 1e6. Wins over the flat
+	// fields for chat cost. Invalid expressions fail config load.
+	Expr string `yaml:"expr"`
 }
 
 // CacheConfig controls the in-memory semantic response cache.
@@ -232,6 +239,13 @@ func (c *Config) Validate() error {
 		for _, fb := range r.FallbackRoutes {
 			if !routeModels[fb] {
 				return fmt.Errorf("route %q fallback_routes references unknown model %q", r.Model, fb)
+			}
+		}
+	}
+	for m, p := range c.Prices {
+		if p.Expr != "" {
+			if _, _, err := pricing.Compile(p.Expr); err != nil {
+				return fmt.Errorf("prices %q: %w", m, err)
 			}
 		}
 	}

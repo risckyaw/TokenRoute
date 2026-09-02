@@ -21,6 +21,7 @@ import (
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
 	"github.com/Jarvisagentic/tokenroute/internal/metrics"
+	"github.com/Jarvisagentic/tokenroute/internal/pricing"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/ratelimit"
 	"github.com/Jarvisagentic/tokenroute/internal/router"
@@ -78,6 +79,9 @@ type Options struct {
 	// StreamIdleMs aborts a streaming relay after N ms without upstream
 	// bytes, per provider name (missing/0 = disabled).
 	StreamIdleMs map[string]int
+	// ProviderTypes maps provider name -> configured type (openai|anthropic|
+	// gemini); expression pricing uses it for anthropic usage semantics.
+	ProviderTypes map[string]string
 	// MaxBodyMB caps request bodies (0 = default 10MB).
 	MaxBodyMB int
 	// SearchBackends enables POST /v1/search when non-empty.
@@ -92,7 +96,8 @@ func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) htt
 func NewWithOptions(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
+		streamIdleMs: o.StreamIdleMs, providerTypes: o.ProviderTypes,
+		maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
 	mux := chi.NewRouter()
 	mux.Use(correlationID)
 	mux.Get("/healthz", s.healthz)
@@ -161,6 +166,8 @@ type srv struct {
 	metrics  *metrics.Registry
 	// streamIdleMs: per-provider stream idle timeout (provider name -> ms).
 	streamIdleMs map[string]int
+	// providerTypes: provider name -> configured type (expr pricing semantics).
+	providerTypes map[string]string
 	maxBody      int64
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
@@ -172,6 +179,46 @@ func (s *srv) price(model string) (usage.Price, bool) {
 	defer s.priceMu.RUnlock()
 	p, ok := s.prices[model]
 	return p, ok
+}
+
+// exprCost evaluates a model's pricing expression against the entry's usage
+// (new-api billingexpr): returns (cost, tier, ok). ok=false when the model
+// has no expr or eval fails (eval errors are logged, cost falls back).
+// anthropicSemantics selects usage normalization per provider type.
+func exprCost(e *usage.Entry, exprStr string, anthropicSemantics bool) (float64, string, bool) {
+	prog, used, err := pricing.Compile(exprStr)
+	if err != nil {
+		return 0, "", false
+	}
+	env := &pricing.Env{
+		P:  float64(e.PromptTokens),
+		C:  float64(e.CompletionTokens),
+		CR: float64(e.CacheReadTokens),
+		CC: float64(e.CacheCreateTokens),
+		Img: float64(e.ImageTokens),
+		Ai: float64(e.AudioInTokens),
+		Ao: float64(e.AudioOutTokens),
+	}
+	pricing.Normalize(env, used, anthropicSemantics)
+	cost, tier, err := pricing.Eval(prog, env)
+	if err != nil {
+		slog.Warn("pricing expr eval", "err", err, "model", e.Model)
+		return 0, "", false
+	}
+	return cost, tier, true
+}
+
+// chatCost computes the USD cost for a chat entry: expression pricing when
+// configured (wins entirely), flat rates otherwise. Returns nil unpriced.
+func (s *srv) chatCost(entry *usage.Entry, p *usage.Price) *float64 {
+	if p.Expr != "" {
+		if cost, tier, ok := exprCost(entry, p.Expr, s.providerTypes[entry.Provider] == "anthropic"); ok {
+			entry.PriceTier = tier
+			return &cost
+		}
+		// fall through to flat on eval failure (expr was valid at load)
+	}
+	return usage.Cost(entry.PromptTokens, entry.CompletionTokens, p)
 }
 
 // SetPrices swaps the price map (pricing sync; config reload).
@@ -781,7 +828,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	entry.LatencyMs = time.Since(start).Milliseconds()
 	entry.Multiplier = mult
 	if p, ok := s.price(cand.Model); ok {
-		entry.CostUSD = usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p)
+		entry.CostUSD = s.chatCost(&entry, &p)
 	}
 	if entry.CostUSD != nil && mult != 1 {
 		*entry.CostUSD *= mult
@@ -1043,6 +1090,11 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 		entry.PromptTokens = parsed.Usage.PromptTokens
 		entry.CompletionTokens = parsed.Usage.CompletionTokens
 		entry.TotalTokens = parsed.Usage.TotalTokens
+		entry.CacheReadTokens = parsed.Usage.CacheRead()
+		entry.CacheCreateTokens = parsed.Usage.CacheCreate()
+		entry.ImageTokens = parsed.Usage.ImageTokens()
+		entry.AudioInTokens = parsed.Usage.AudioIn()
+		entry.AudioOutTokens = parsed.Usage.AudioOut()
 		if entry.TotalTokens == 0 {
 			// Upstream omitted/zero total: derive from parts.
 			entry.TotalTokens = entry.PromptTokens + entry.CompletionTokens
@@ -1059,7 +1111,7 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 		w.Header().Set("X-TokenRoute-Completion-Tokens", strconv.Itoa(entry.CompletionTokens))
 		w.Header().Set("X-TokenRoute-Total-Tokens", strconv.Itoa(entry.TotalTokens))
 		if p, ok := s.price(entry.Model); ok {
-			if cost := usage.Cost(entry.PromptTokens, entry.CompletionTokens, &p); cost != nil {
+			if cost := s.chatCost(entry, &p); cost != nil {
 				w.Header().Set("X-TokenRoute-Cost-USD", strconv.FormatFloat(*cost, 'f', -1, 64))
 			}
 		}
@@ -1113,6 +1165,11 @@ func (s *srv) relayStream(w http.ResponseWriter, resp *http.Response, entry *usa
 		entry.PromptTokens = u.PromptTokens
 		entry.CompletionTokens = u.CompletionTokens
 		entry.TotalTokens = u.TotalTokens
+		entry.CacheReadTokens = u.CacheRead()
+		entry.CacheCreateTokens = u.CacheCreate()
+		entry.ImageTokens = u.ImageTokens()
+		entry.AudioInTokens = u.AudioIn()
+		entry.AudioOutTokens = u.AudioOut()
 		if entry.TotalTokens == 0 {
 			entry.TotalTokens = entry.PromptTokens + entry.CompletionTokens
 		}
