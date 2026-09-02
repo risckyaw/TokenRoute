@@ -202,6 +202,37 @@ type Config struct {
 	// in key∩candidate intersection; empty intersection = 1.0. Unset =
 	// current behavior. Cost-only; routing/filtering unaffected.
 	GroupRatio map[string]float64 `yaml:"group_ratio"`
+	// FailureRules (9router errorConfig.js ERROR_RULES): ordered per-failure
+	// cooldown overrides, text rules first then status rules, first hit wins.
+	// Unset = the circuit's own cooldown behavior, unchanged.
+	FailureRules []FailureRuleConfig `yaml:"failure_rules"`
+}
+
+// FailureRuleConfig is one cooldown rule: match (case-insensitive substring of
+// the upstream error body) OR status, with a fixed cooldown_ms or escalating
+// backoff (2s doubling per hit for that provider, capped at 5min, reset on
+// success). Rules with neither/both selectors fail config load.
+type FailureRuleConfig struct {
+	Match      string `yaml:"match"`
+	Status     int    `yaml:"status"`
+	CooldownMs int    `yaml:"cooldown_ms"`
+	Backoff    bool   `yaml:"backoff"`
+}
+
+// failureRules converts the config rules to router rules.
+func (c *Config) failureRules() []router.FailureRule {
+	out := make([]router.FailureRule, 0, len(c.FailureRules))
+	for _, r := range c.FailureRules {
+		out = append(out, router.FailureRule{
+			Match: r.Match, Status: r.Status, CooldownMs: r.CooldownMs, Backoff: r.Backoff,
+		})
+	}
+	return out
+}
+
+// FailureRules builds the validated rule set (nil when unconfigured).
+func (c *Config) FailureRulesPolicy() (*router.FailureRules, error) {
+	return router.NewFailureRules(c.failureRules())
 }
 
 // RetryPolicyConfig (new-api status_code_ranges + AutomaticDisableKeywords):
@@ -320,6 +351,9 @@ func (c *Config) Validate() error {
 		if _, err := router.NewRetryPolicy(rp.RetryStatusRanges, rp.DisableStatusRanges, rp.NeverRetry, rp.DisableKeywords); err != nil {
 			return fmt.Errorf("retry_policy: %w", err)
 		}
+	}
+	if _, err := c.FailureRulesPolicy(); err != nil {
+		return err
 	}
 	return nil
 }

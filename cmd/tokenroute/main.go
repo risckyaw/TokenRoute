@@ -248,6 +248,13 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 			return nil, fmt.Errorf("retry_policy: %w", err)
 		}
 	}
+	// failure_rules (9router ERROR_RULES): ordered text/status cooldown
+	// overrides; nil when unconfigured (built-in circuit cooldowns).
+	fr, err := cfg.FailureRulesPolicy()
+	if err != nil {
+		return nil, err
+	}
+	rt.SetFailureRules(fr)
 	return &serverState{router: rt, prices: prices, streamIdleMs: sit, providerTypes: ptypes, retryPolicy: rp, groupRatio: cfg.GroupRatio, maxBodyMB: cfg.MaxBodyMB, searchBackends: backends}, nil
 }
 

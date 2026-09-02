@@ -271,6 +271,30 @@ the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
 
+## Per-failure cooldown rules
+
+`failure_rules:` (9router `errorConfig.js`) sets the circuit cooldown per
+failure instead of globally per provider. Rules are ordered — every `match`
+rule (case-insensitive substring of the upstream error body) is checked first,
+then the `status` rules; first hit wins:
+
+```yaml
+failure_rules:
+  - {match: "overloaded", cooldown_ms: 4000}
+  - {match: "rate limit", backoff: true}
+  - {status: 401, cooldown_ms: 120000}
+```
+
+A matching rule overrides both the breaker's configured `cooldown_ms` and the
+429 `Retry-After` honoring. Failure *classification* is untouched, so metrics
+and `allowed_fails` budgets still see the real failure kind. `backoff: true`
+escalates per provider — 2s, 4s, 8s … capped at 5 minutes — and resets on that
+provider's next success. Each rule needs exactly one selector and exactly one
+cooldown source; anything else fails config load. Status rules also fire on
+terminal (relayed, non-failover) statuses like 401 — prefer `cooldown_ms`
+there, since a reachable 4xx counts as a provider success and resets backoff.
+Unset `failure_rules` leaves cooldown behavior exactly as before.
+
 ## Capability-aware routing
 
 Requests carrying non-text content are ranked onto models that can actually
@@ -335,6 +359,7 @@ terminal failures are never modified.
 | `health_check` | Global background-probe default `{enabled, interval_ms}`; per-provider block wins |
 | `retry_policy` | Optional `{retry_status_ranges, never_retry, disable_status_ranges, disable_keywords}` failover/disable overrides (unset = built-in) |
 | `group_ratio` | Optional map group → cost multiplier; applied on key∩candidate group intersection, cost-only |
+| `failure_rules` | Optional ordered `[{match\|status, cooldown_ms\|backoff}]` per-failure circuit cooldowns (unset = built-in) |
 
 Provider types:
 

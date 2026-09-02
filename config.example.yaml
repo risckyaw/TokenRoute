@@ -337,3 +337,21 @@ routes:
 #  never_retry: [504, 524]
 #  disable_status_ranges: "401"
 #  disable_keywords: ["insufficient balance", "account suspended", "quota exceeded"]
+
+# Per-failure cooldown rules (9router errorConfig.js ERROR_RULES). Ordered:
+# every `match` rule (case-insensitive substring of the upstream error body) is
+# checked first, in order, then the `status` rules — first hit wins. A matching
+# rule sets that failure's circuit cooldown, overriding both the breaker's
+# configured cooldown_ms and the 429 Retry-After honoring. Failure
+# CLASSIFICATION is untouched, so metrics and allowed_fails budgets still see
+# the real kind. Each rule needs exactly one selector (match OR status) and
+# exactly one cooldown source (cooldown_ms OR backoff: true) — anything else
+# fails config load. backoff: true escalates per provider 2s, 4s, 8s ... capped
+# at 5min, and resets on that provider's next success. Status rules also apply
+# to terminal (relayed, non-failover) statuses like 401; use cooldown_ms there,
+# since a reachable 4xx counts as a provider success and resets backoff.
+# UNSET = current cooldown behavior exactly.
+#failure_rules:
+#  - {match: "overloaded", cooldown_ms: 4000}
+#  - {match: "rate limit", backoff: true}
+#  - {status: 401, cooldown_ms: 120000}

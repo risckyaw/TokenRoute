@@ -166,6 +166,21 @@ type Router struct {
 	// modalities: model -> supported non-text input modalities, from the
 	// models.dev catalog sync; nil disables capability-aware reordering.
 	modalities func(model string) ([]string, bool)
+	// failureRules: configured per-failure cooldown overrides (nil = built-in
+	// circuit cooldowns).
+	failureRules *FailureRules
+}
+
+// SetFailureRules installs the configured cooldown rules (nil = built-in).
+func (r *Router) SetFailureRules(fr *FailureRules) {
+	r.failureRules = fr
+}
+
+// FailureCooldown returns the cooldown a configured failure rule prescribes
+// for this provider's failure; ok=false leaves the circuit's own cooldown in
+// charge (and is always the case when failure_rules is unset).
+func (r *Router) FailureCooldown(providerName string, status int, bodySnippet string) (time.Duration, bool) {
+	return r.failureRules.Cooldown(providerName, status, bodySnippet)
 }
 
 // ProviderOverride carries a provider's set-only request mutations.
@@ -866,6 +881,10 @@ func (r *Router) RecordResultKind(providerName string, latency time.Duration, su
 		} else {
 			cb.OnFailureKind(kind, countsAgainstProvider)
 		}
+	}
+	if success {
+		// A working provider starts its failure-rule backoff over at the base.
+		r.failureRules.OnSuccess(providerName)
 	}
 	for _, rt := range r.routes {
 		if rt.Strategy != StrategyLKGP {

@@ -724,6 +724,14 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 					s.router.OpenCircuitFor(c.Provider.Name(), d)
 				}
 			}
+			// failure_rules (9router ERROR_RULES): a matching rule sets this
+			// failure's cooldown, overriding both the breaker's configured
+			// cooldown and the Retry-After honoring above. Classification is
+			// untouched, so metrics and allowed_fails budgets still see the
+			// real failure kind. Last so the rule's duration is what sticks.
+			if d, ok := s.router.FailureCooldown(c.Provider.Name(), att.StatusCode, string(errBody)); ok {
+				s.router.OpenCircuitFor(c.Provider.Name(), d)
+			}
 			if lastFailResp != nil {
 				lastFailResp.Body.Close()
 			}
@@ -741,6 +749,19 @@ func (s *srv) failoverPass(ctx context.Context, hdr, blocked http.Header, body [
 		}
 		// Deterministic answer: 2xx success, other 4xx reachable — no failover.
 		s.router.RecordResult(c.Provider.Name(), time.Since(attemptStart), true)
+		if att.StatusCode >= 400 {
+			// failure_rules on a terminal status (e.g. {status: 401}): the
+			// response relays as-is, but the rule's cooldown still applies.
+			// Only status rules can fire here — the body streams to the client
+			// unbuffered, so there is no text to match.
+			// ponytail: a reachable 4xx counts as a provider success above, so
+			// backoff: true restarts at 2s on this path. Use cooldown_ms for
+			// terminal statuses; wire an escalation-preserving success signal
+			// if per-status escalation is ever actually needed.
+			if d, ok := s.router.FailureCooldown(c.Provider.Name(), att.StatusCode, ""); ok {
+				s.router.OpenCircuitFor(c.Provider.Name(), d)
+			}
+		}
 		// Inflight stays counted until the relayed body is fully read/closed
 		// (covers both buffered and SSE streaming relays).
 		att.Body = &inflightBody{ReadCloser: att.Body, done: func() {

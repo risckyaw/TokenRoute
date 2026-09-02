@@ -147,3 +147,62 @@ routes:
 		t.Fatalf("sticky 1 rejected: %v", err)
 	}
 }
+
+// failure_rules must be validated at load: a rule needs exactly one selector
+// and exactly one cooldown source.
+func TestFailureRulesConfig(t *testing.T) {
+	tmpl := `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: auto
+    candidates:
+      - provider: p1
+        model: up
+failure_rules:
+%s
+`
+	good := `  - {match: "overloaded", cooldown_ms: 4000}
+  - {match: "rate limit", backoff: true}
+  - {status: 401, cooldown_ms: 120000}`
+	cfg, err := Load(writeCfg(t, fmt.Sprintf(tmpl, good)))
+	if err != nil {
+		t.Fatalf("valid failure_rules rejected: %v", err)
+	}
+	fr, err := cfg.FailureRulesPolicy()
+	if err != nil || fr == nil {
+		t.Fatalf("policy = %v, %v; want a non-nil rule set", fr, err)
+	}
+
+	for name, rule := range map[string]string{
+		"no selector":          `  - {cooldown_ms: 1000}`,
+		"both selectors":       `  - {match: "x", status: 429, cooldown_ms: 1000}`,
+		"no cooldown":          `  - {match: "x"}`,
+		"cooldown and backoff": `  - {status: 429, cooldown_ms: 1000, backoff: true}`,
+	} {
+		if _, err := Load(writeCfg(t, fmt.Sprintf(tmpl, rule))); err == nil {
+			t.Errorf("%s: must fail config load", name)
+		}
+	}
+
+	// Unset failure_rules yields a nil policy (legacy behavior).
+	bare, err := Load(writeCfg(t, `
+providers:
+  - name: p1
+    type: openai
+    base_url: http://x
+routes:
+  - model: auto
+    candidates:
+      - provider: p1
+        model: up
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fr, err := bare.FailureRulesPolicy(); err != nil || fr != nil {
+		t.Fatalf("unset policy = %v, %v; want nil, nil", fr, err)
+	}
+}
