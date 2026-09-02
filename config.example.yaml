@@ -144,6 +144,10 @@ routes:
   # "credits exhausted") locks that provider+model for 15 minutes instead of
   # the short rate-limit cooldown — quota exhaustion is not a rate limit.
   # Client aborts (disconnect mid-stream) never trip circuit breakers.
+  # When EVERY candidate is rate-limited, the relayed 429 keeps the upstream
+  # body but Retry-After is rewritten to the earliest reset known across the
+  # route (upstream hints, quota windows, circuit cooldowns) and
+  # X-TokenRoute-Retry-After-Source names the winning source. No config.
   # Breakers gain a DEGRADED warning band at 60% of threshold (threshold>=4),
   # and the open cooldown doubles after 3 failed probe cycles (16x cap).
   - model: auto

@@ -271,6 +271,20 @@ the quota-aware strategies (`reset_aware`, `fill_first`, `auto`) prefer this
 provider-signalled state over local accounting (Kong response-ratelimiting
 style). Missing or invalid headers are ignored — zero config, zero cost.
 
+## Earliest Retry-After on terminal 429
+
+When every candidate is rate-limited the gateway still relays the last
+upstream 429 body verbatim, but rewrites `Retry-After` to the **earliest**
+known reset across the whole route (9router `combo.js`): a sibling candidate
+whose limit clears in 30s beats the relayed candidate's 10-minute cooldown.
+The instants come from upstream 429 rate-limit/`Retry-After` headers (kept as
+model locks), the quota ledger's window reset for candidates with no budget
+left, and circuit-breaker probe times — including candidates that were
+filtered out before the failover loop ran. `X-TokenRoute-Retry-After-Source:
+upstream|quota|circuit` names the winning source; when the relayed value is
+already the soonest it is left untouched and no marker is set. Non-429
+terminal failures are never modified.
+
 ## Configuration
 
 `config.yaml` — secrets only via `${ENV_VAR}` placeholders:

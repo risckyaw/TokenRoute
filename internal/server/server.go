@@ -371,6 +371,64 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// resetHint is the EARLIEST known reset instant across the candidates tried
+// (or skipped) while serving one request — ported from 9router combo.js: when
+// every candidate is rate-limited the client should be told when the SOONEST
+// one frees up, not what the last candidate's Retry-After happened to say.
+//
+// Sources: "upstream" (a 429's own rate-limit reset / Retry-After header, which
+// failoverPass already persisted as that candidate's model lock), "quota" (the
+// ledger's window reset for a candidate with no budget left), "circuit" (when
+// an open breaker allows a probe again). Reading the persisted state instead of
+// threading observations through the failover signatures also covers candidates
+// OrderCandidates filtered out before the loop ever saw them.
+type resetHint struct {
+	at     time.Time
+	source string
+}
+
+// observe folds one candidate's reset instant in, keeping the earliest.
+// Zero/past instants are ignored.
+func (h *resetHint) observe(at time.Time, source string) {
+	if at.IsZero() || !at.After(time.Now()) {
+		return
+	}
+	if h.at.IsZero() || at.Before(h.at) {
+		h.at, h.source = at, source
+	}
+}
+
+// seconds returns whole seconds until the hinted reset (0 when unset).
+func (h *resetHint) seconds() int {
+	if h.at.IsZero() {
+		return 0
+	}
+	d := time.Until(h.at)
+	if d <= 0 {
+		return 0
+	}
+	return int(d.Seconds()) + 1
+}
+
+// earliestReset aggregates the reset instants of every candidate of the route
+// (falling back to the candidates actually tried for passthrough requests).
+func (s *srv) earliestReset(model string, tried []router.Candidate) resetHint {
+	cands := tried
+	if rt := s.router.Resolve(model); rt != nil {
+		cands = rt.Candidates
+	}
+	var h resetHint
+	for _, c := range cands {
+		name := c.Provider.Name()
+		h.observe(s.router.ModelLockUntil(name, c.Model), "upstream")
+		if rem, _, known := s.router.Quota().Remaining(name, c.Model); known && rem <= 0 {
+			h.observe(s.router.Quota().WindowReset(name, c.Model), "quota")
+		}
+		h.observe(s.router.CircuitOpenUntil(name), "circuit")
+	}
+	return h
+}
+
 // callFn is one upstream call shape (chat or embeddings).
 type callFn func(context.Context, provider.Provider, *provider.Request) (*http.Response, error)
 
@@ -839,26 +897,31 @@ func keyString(k *auth.Key) string {
 
 // relayAllFailed writes the terminal response when every candidate failed:
 // the last retryable upstream response as-is, else a 502 transport error.
-// When the failure is an upstream 429, the Retry-After header is raised to
-// the earliest known reset across model locks and the upstream hint.
-func (s *srv) relayAllFailed(w http.ResponseWriter, entry *usage.Entry, lastFailResp *http.Response, lastErr error) {
-	if lastFailResp != nil {
-		// All candidates failed with retryable upstream statuses:
-		// relay the last one as-is (Phase 1 transparency).
-		entry.Status = lastFailResp.StatusCode
-		if lastFailResp.StatusCode == http.StatusTooManyRequests {
-			if until := s.router.ModelLockUntil(entry.Provider, entry.Model); !until.IsZero() {
-				secs := int(time.Until(until).Seconds()) + 1
-				cur, _ := strconv.Atoi(lastFailResp.Header.Get("Retry-After"))
-				if secs > cur {
-					lastFailResp.Header.Set("Retry-After", strconv.Itoa(secs))
-				}
+// When the failure is an upstream 429, Retry-After is set to the EARLIEST
+// known reset across all candidates of the route (9router combo.js): the
+// relayed response belongs to the LAST candidate, whose cooldown may be far
+// longer than a sibling's. A shorter relayed value is left alone (already the
+// best hint) and X-TokenRoute-Retry-After-Source marks the winning source.
+// The body is never rewritten — raw relay is by design.
+func (s *srv) relayAllFailed(w http.ResponseWriter, entry *usage.Entry, lastFailResp *http.Response, lastErr error, model string, tried []router.Candidate) {
+	if lastFailResp == nil {
+		writeErr(w, http.StatusBadGateway, "upstream error: "+lastErr.Error(), "upstream_error")
+		return
+	}
+	// All candidates failed with retryable upstream statuses:
+	// relay the last one as-is (Phase 1 transparency).
+	entry.Status = lastFailResp.StatusCode
+	if lastFailResp.StatusCode == http.StatusTooManyRequests {
+		hint := s.earliestReset(model, tried)
+		if secs := hint.seconds(); secs > 0 {
+			cur, err := strconv.Atoi(lastFailResp.Header.Get("Retry-After"))
+			if err != nil || cur <= 0 || secs < cur {
+				lastFailResp.Header.Set("Retry-After", strconv.Itoa(secs))
+				w.Header().Set("X-TokenRoute-Retry-After-Source", hint.source)
 			}
 		}
-		s.relayFull(w, lastFailResp, entry)
-	} else {
-		writeErr(w, http.StatusBadGateway, "upstream error: "+lastErr.Error(), "upstream_error")
 	}
+	s.relayFull(w, lastFailResp, entry)
 }
 
 func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -963,7 +1026,7 @@ func (s *srv) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Stream: stream, Status: http.StatusBadGateway,
 			LatencyMs: time.Since(start).Milliseconds(),
 		}
-		s.relayAllFailed(w, &entry, lastFailResp, lastErr)
+		s.relayAllFailed(w, &entry, lastFailResp, lastErr, model, candidates)
 		entry.LatencyMs = time.Since(start).Milliseconds()
 		s.logEntry(r.Context(), entry)
 		return
@@ -1056,7 +1119,7 @@ func (s *srv) embeddings(w http.ResponseWriter, r *http.Request) {
 			Provider: cand.Provider.Name(), Model: cand.Model,
 			Status: http.StatusBadGateway,
 		}
-		s.relayAllFailed(w, &entry, lastFailResp, lastErr)
+		s.relayAllFailed(w, &entry, lastFailResp, lastErr, model, candidates)
 		entry.LatencyMs = time.Since(start).Milliseconds()
 		s.logEntry(r.Context(), entry)
 		return
@@ -1345,7 +1408,7 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 			entry.TotalTokens = entry.PromptTokens + entry.CompletionTokens
 		}
 	}
-	for _, h := range []string{"Content-Type", "Cache-Control"} {
+	for _, h := range []string{"Content-Type", "Cache-Control", "Retry-After"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
@@ -1369,7 +1432,7 @@ func (s *srv) relayFull(w http.ResponseWriter, resp *http.Response, entry *usage
 // relayStream copies the upstream SSE stream to the client byte-for-byte,
 // flushing per write, while feeding completed lines to a usage tracker.
 func (s *srv) relayStream(w http.ResponseWriter, resp *http.Response, entry *usage.Entry) {
-	for _, h := range []string{"Content-Type", "Cache-Control"} {
+	for _, h := range []string{"Content-Type", "Cache-Control", "Retry-After"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
