@@ -18,6 +18,24 @@ func dashboardHTMLForTest(t *testing.T) string {
 	return rec.Body.String()
 }
 
+func TestDashboardShellLoadsWithoutAdminKey(t *testing.T) {
+	h, _ := adminSetup(t)
+	rec := adminReq(t, h, http.MethodGet, "/admin/", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard shell status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `id="key"`) {
+		t.Fatal("dashboard shell missing admin-key input")
+	}
+
+	// The shell is static; data remains protected until the entered key is sent
+	// through X-Admin-Key by dashboard.js.
+	rec = adminReq(t, h, http.MethodGet, "/admin/keys", "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated data API status = %d, want 401", rec.Code)
+	}
+}
+
 func TestDashboardAssetsEmbedded(t *testing.T) {
 	h, _ := adminSetup(t)
 	for _, path := range []string{"/admin/", "/admin/assets/dashboard.css", "/admin/assets/dashboard.js"} {

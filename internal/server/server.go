@@ -127,18 +127,22 @@ func NewAdminOnly(o Options) http.Handler {
 }
 
 func (s *srv) registerAdmin(mux chi.Router) {
-	// Static dashboard assets: no config/private payload, served unauthenticated.
+	// Static dashboard shell/assets carry no config/private payload. The shell
+	// must load unauthenticated so users can enter an admin key after a 401.
 	mux.Get("/admin/assets/dashboard.css", s.adminDashboardCSS)
 	mux.Get("/admin/assets/dashboard.js", s.adminDashboardJS)
 	mux.Route("/admin", func(r chi.Router) {
-		r.Use(s.requireAdmin)
-		// Dashboard document + read APIs: header or ?key= query auth.
+		// The static shell must load before the browser knows the admin key.
 		r.Get("/", s.adminDashboard)
-		r.Get("/keys", s.adminListKeys)
-		r.Get("/usage", s.adminUsage)
-		r.Get("/usage/logs", s.adminUsageLogs)
-		r.Get("/usage/export", s.adminUsageExport)
-		r.Get("/providers", s.adminProviders)
+		r.Group(func(authenticated chi.Router) {
+			authenticated.Use(s.requireAdmin)
+			// Read APIs: header or ?key= query auth.
+			authenticated.Get("/keys", s.adminListKeys)
+			authenticated.Get("/usage", s.adminUsage)
+			authenticated.Get("/usage/logs", s.adminUsageLogs)
+			authenticated.Get("/usage/export", s.adminUsageExport)
+			authenticated.Get("/providers", s.adminProviders)
+		})
 		// Mutations: header-only auth — query keys leak into logs/proxies.
 		r.Group(func(m chi.Router) {
 			m.Use(s.requireAdminHeader)
