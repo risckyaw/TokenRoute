@@ -61,6 +61,9 @@ func New(cfg Config) *Provider {
 func (p *Provider) Name() string      { return p.name }
 func (p *Provider) Priority() int     { return p.priority }
 func (p *Provider) ModelsURL() string { return p.baseURL + "/messages" }
+func (p *Provider) CloseIdleConnections() {
+	p.client.CloseIdleConnections()
+}
 
 // staticModels: Anthropic has no public /models on this API path.
 var staticModels = []string{

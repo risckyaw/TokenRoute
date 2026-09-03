@@ -61,6 +61,9 @@ func New(cfg Config) *Provider {
 func (p *Provider) Name() string      { return p.name }
 func (p *Provider) Priority() int     { return p.priority }
 func (p *Provider) ModelsURL() string { return p.baseURL + "/models" }
+func (p *Provider) CloseIdleConnections() {
+	p.client.CloseIdleConnections()
+}
 
 func (p *Provider) Models(ctx context.Context) ([]string, error) {
 	key, _ := p.pool.Pick()

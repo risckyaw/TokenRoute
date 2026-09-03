@@ -25,7 +25,7 @@ type Entry struct {
 }
 
 // Syncer downloads the models.dev catalog daily and merges it into the
-// price map. ETag-cached; failures are swallowed (stale file is fine).
+// shared price store. ETag-cached; failures are swallowed (stale file is fine).
 type Syncer struct {
 	url      string
 	file     string // cache file next to the DB
@@ -35,7 +35,7 @@ type Syncer struct {
 	mu     sync.Mutex
 	etag   string
 	models map[string]Entry // normalized model id -> entry
-	prices map[string]usage.Price
+	prices *usage.PriceStore
 }
 
 // models.dev api.json shape (trimmed to what we read).
@@ -52,7 +52,7 @@ type apiJSON map[string]struct {
 }
 
 // NewSyncer builds a daily syncer. interval <= 0 = 24h.
-func NewSyncer(file, url string, interval time.Duration, prices map[string]usage.Price) *Syncer {
+func NewSyncer(file, url string, interval time.Duration, prices *usage.PriceStore) *Syncer {
 	if interval <= 0 {
 		interval = 24 * time.Hour
 	}
@@ -144,7 +144,7 @@ func parse(raw []byte) map[string]Entry {
 	return out
 }
 
-// merge applies synced capabilities to the price map, strictly additive:
+// merge applies synced capabilities to the price store, strictly additive:
 // only models with no configured price get a synthetic entry (context guard
 // only, no cost). Returns the count of models added.
 func (s *Syncer) merge(models map[string]Entry) int {
@@ -156,17 +156,18 @@ func (s *Syncer) merge(models map[string]Entry) int {
 		if e.ContextTokens <= 0 {
 			continue
 		}
-		if _, ok := s.prices[id]; ok {
+		if s.prices.Has(id) {
 			continue // hand-written table wins
 		}
-		s.prices[id] = usage.Price{ContextTokens: e.ContextTokens}
+		s.prices.Set(id, usage.Price{ContextTokens: e.ContextTokens})
 		added++
 	}
 	return added
 }
 
-// loadCache restores the last synced catalog from disk (startup fast path).
-func (s *Syncer) loadCache() {
+// LoadCache restores the last synced catalog from disk (startup fast path).
+// Exported so the runtime reloader can warm a candidate state before swap.
+func (s *Syncer) LoadCache() {
 	raw, err := os.ReadFile(s.file)
 	if err != nil {
 		return
@@ -219,10 +220,10 @@ func (s *Syncer) Modalities(model string) ([]string, bool) {
 	return e.Modalities, true
 }
 
-// Run starts the daily sync loop until ctx cancels. First sync after a
-// 60s startup delay so the server serves requests before fetching.
+// Run starts the daily sync loop until ctx cancels. Callers load any persisted
+// cache before Run so candidate state can be warmed before it is exposed.
+// First network sync waits 60s so the server serves requests before fetching.
 func (s *Syncer) Run(ctx context.Context) {
-	s.loadCache()
 	select {
 	case <-ctx.Done():
 		return

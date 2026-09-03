@@ -57,7 +57,7 @@ func TestObserveUpstreamQuotaHeaders(t *testing.T) {
 	if !known || rem != 12345 {
 		t.Fatalf("remaining = %d known=%v, want 12345 true", rem, known)
 	}
-	if reset := s.router.Quota().WindowReset("p1", "m1"); reset.Before(time.Now().Add(89*time.Second)) {
+	if reset := s.router.Quota().WindowReset("p1", "m1"); reset.Before(time.Now().Add(89 * time.Second)) {
 		t.Fatalf("reset = %v, want ~90s out", reset)
 	}
 

@@ -29,7 +29,7 @@ func TestRouteMultiplier_DoublesCost(t *testing.T) {
 	}
 	t.Cleanup(func() { ul.Close() })
 	prices := map[string]usage.Price{"up-model": {PromptPer1M: 2, CompletionPer1M: 4}}
-	h := NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices})
+	h := NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices)})
 
 	rec := postChat(t, h, "", "auto")
 	if rec.Code != 200 {

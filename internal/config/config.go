@@ -2,7 +2,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -72,10 +74,10 @@ type ProviderConfig struct {
 	// rewrite (candidate-level param_override wins on key conflict);
 	// header_override sets upstream request headers; header_pass forwards
 	// client headers (glob, case-insensitive) bypassing filterHeaders.
-	ParamOverride  map[string]any   `yaml:"param_override"`
-	ParamDelete    []string         `yaml:"param_delete"`
+	ParamOverride  map[string]any    `yaml:"param_override"`
+	ParamDelete    []string          `yaml:"param_delete"`
 	HeaderOverride map[string]string `yaml:"header_override"`
-	HeaderPass     []string         `yaml:"header_pass"`
+	HeaderPass     []string          `yaml:"header_pass"`
 	// BalanceProbe polls a DeepSeek-style balance endpoint (opt-in): below
 	// min_usd the provider is marked out of balance and quota-aware strategies
 	// treat it as exhausted until a probe above the threshold clears it.
@@ -274,15 +276,44 @@ type RetryPolicyConfig struct {
 	DisableKeywords     []string `yaml:"disable_keywords"`      // case-insensitive body substrings
 }
 
+func Decode(data []byte, expandEnv bool) (*Config, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		return nil, fmt.Errorf("parse config: multiple YAML documents are not allowed")
+	}
+	if expandEnv {
+		expandConfigEnv(&cfg)
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = ":8400"
+	}
+	if cfg.UsageDB == "" {
+		cfg.UsageDB = "data/usage.db"
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
+	return Decode(data, true)
+}
+
+func expandConfigEnv(cfg *Config) {
 	for i := range cfg.Providers {
 		cfg.Providers[i].BaseURL = expandIfPresent(cfg.Providers[i].BaseURL)
 		cfg.Providers[i].APIKey = expandIfPresent(cfg.Providers[i].APIKey)
@@ -297,16 +328,6 @@ func Load(path string) (*Config, error) {
 			cfg.Search[i].APIKeys[j] = expandIfPresent(cfg.Search[i].APIKeys[j])
 		}
 	}
-	if cfg.Listen == "" {
-		cfg.Listen = ":8400"
-	}
-	if cfg.UsageDB == "" {
-		cfg.UsageDB = "data/usage.db"
-	}
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
 }
 
 // expandIfPresent expands $VAR / ${VAR}; empty expansion stays empty
@@ -415,13 +436,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validStrategy mirrors router strategy names; kept local to avoid an import.
+// validStrategy reports whether s is a known router strategy; backed by
+// strategyNames (single list shared with the form schema).
 func validStrategy(s string) bool {
-	switch s {
-	case "priority", "round_robin", "least_latency", "weighted", "cost", "lkgp", "headroom", "fusion",
-		"p2c", "reset_aware", "fill_first", "auto", "lowest_usage", "peak_ewma", "least_connections",
-		"consistent_hash", "fusion_judge":
-		return true
+	for _, name := range strategyNames() {
+		if s == name {
+			return true
+		}
 	}
 	return false
 }

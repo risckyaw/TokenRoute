@@ -50,7 +50,7 @@ func setupEmb(t *testing.T, base1, base2 string, prices map[string]usage.Price) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ul.Close() })
-	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices}), ul
+	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices)}), ul
 }
 
 func postEmb(t *testing.T, h http.Handler) *httptest.ResponseRecorder {

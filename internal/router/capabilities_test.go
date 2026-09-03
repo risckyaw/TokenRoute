@@ -196,11 +196,11 @@ func TestCapabilityTieringPartialCoverage(t *testing.T) {
 func TestCapabilityTieringOverridesStrategy(t *testing.T) {
 	r, rt := capsRouter(t, visionCatalog)
 	rt.Strategy = StrategyCost
-	r.SetPrices(map[string]usage.Price{
+	r.SetPrices(usage.NewPriceStore(map[string]usage.Price{
 		"text-only":    {PromptPer1M: 0.1, CompletionPer1M: 0.1}, // cheapest
 		"vision":       {PromptPer1M: 10, CompletionPer1M: 10},   // priciest
 		"uncatalogued": {PromptPer1M: 1, CompletionPer1M: 1},
-	})
+	}))
 	// Without a media requirement, cost ordering stands.
 	if got := names(r.OrderCandidatesCaps(rt, nil, "", nil)); got[0] != "a" {
 		t.Fatalf("got %v, want cheapest (a) first", got)

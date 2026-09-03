@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -116,6 +117,52 @@ func splitLines(s string) []string {
 		out = append(out, cur)
 	}
 	return out
+}
+
+func TestDecodeRejectsUnknownField(t *testing.T) {
+	_, err := Decode([]byte("unknown_option: true\n"), false)
+	if err == nil || !strings.Contains(err.Error(), "field unknown_option not found") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDecodeRejectsDuplicateKey(t *testing.T) {
+	_, err := Decode([]byte("listen: :8400\nlisten: :9400\n"), false)
+	if err == nil || !strings.Contains(err.Error(), "already defined") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDecodeRejectsTrailingYAMLDocuments(t *testing.T) {
+	for _, trailing := range []string{"", "{}", "value", "null"} {
+		t.Run(trailing, func(t *testing.T) {
+			_, err := Decode([]byte("listen: :8400\n---\n"+trailing+"\n"), false)
+			if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsTrailingYAMLDocuments(t *testing.T) {
+	for _, trailing := range []string{"", "{}", "value", "null"} {
+		t.Run(trailing, func(t *testing.T) {
+			_, err := Load(writeCfg(t, "listen: :8400\n---\n"+trailing+"\n"))
+			if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeCanPreserveEnvironmentReferences(t *testing.T) {
+	cfg, err := Decode([]byte("admin_key: ${GATEWAY_ADMIN_KEY}\n"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminKey != "${GATEWAY_ADMIN_KEY}" {
+		t.Fatalf("admin_key = %q", cfg.AdminKey)
+	}
 }
 
 // sticky is round_robin-only and must be non-negative.

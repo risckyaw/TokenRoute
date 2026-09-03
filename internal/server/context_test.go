@@ -25,7 +25,7 @@ func ctxSetup(t *testing.T, prices map[string]usage.Price, cands ...router.Candi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ul.Close() })
-	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices})
+	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices)})
 }
 
 func bigPrompt(n int) string {

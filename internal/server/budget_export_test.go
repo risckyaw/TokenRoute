@@ -34,7 +34,7 @@ func budgetSetup(t *testing.T) (http.Handler, *usage.Logger) {
 	prices := map[string]usage.Price{
 		"up-model": {PromptPer1M: 1.0, CompletionPer1M: 1.0}, // $2/1M combined
 	}
-	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices}), ul
+	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices)}), ul
 }
 
 func TestBudget_PreFlight402(t *testing.T) {
@@ -100,7 +100,7 @@ func TestBudget_UnknownPriceAllows(t *testing.T) {
 		Model:      "auto",
 		Candidates: []router.Candidate{{Provider: fp, Model: "unpriced"}},
 	}})
-	h := NewWithOptions(Options{Router: rt, Prices: map[string]usage.Price{}})
+	h := NewWithOptions(Options{Router: rt, Prices: usage.NewPriceStore(nil)})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto"}`))
 	req.Header.Set("X-Max-Cost-USD", "0.0000001")
 	rec := httptest.NewRecorder()

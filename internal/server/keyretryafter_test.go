@@ -31,7 +31,7 @@ func TestKey429RetryAfterRPM(t *testing.T) {
 
 func TestKey429RetryAfterTPM(t *testing.T) {
 	h, _, k := authSetup(t, func(k *auth.Key) { k.TPM = 1 }) // 1 token/min
-	_ = postChat(t, h, k.Key, "auto") // first request: bucket starts with 1 token, post-request deduct drains it
+	_ = postChat(t, h, k.Key, "auto")                        // first request: bucket starts with 1 token, post-request deduct drains it
 	rec := postChat(t, h, k.Key, "auto")
 	if rec.Code != 429 {
 		t.Fatalf("status %d, want 429 (TPM=1 exhausted)", rec.Code)

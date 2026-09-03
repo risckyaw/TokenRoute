@@ -116,6 +116,7 @@ type Registry struct {
 	tokens    counter // tokenroute_tokens_total{key,provider,kind}
 	cacheHits counter // tokenroute_cache_hits_total
 	latency   histogram
+	gaugeMu   sync.RWMutex
 	// CircuitOpen reports 1 when the provider's circuit is open (read at scrape).
 	CircuitOpen func(provider string) bool
 	// Inflight reports the provider's live upstream request count (read at scrape).
@@ -124,6 +125,21 @@ type Registry struct {
 }
 
 func New() *Registry { return &Registry{} }
+
+func (r *Registry) BindGauges(providers func() []string, circuitOpen func(string) bool, inflight func(string) int) {
+	r.gaugeMu.Lock()
+	r.Providers = providers
+	r.CircuitOpen = circuitOpen
+	r.Inflight = inflight
+	r.gaugeMu.Unlock()
+}
+
+// gaugeSnapshot returns one consistent set of callbacks for a scrape.
+func (r *Registry) gaugeSnapshot() (func() []string, func(string) bool, func(string) int) {
+	r.gaugeMu.RLock()
+	defer r.gaugeMu.RUnlock()
+	return r.Providers, r.CircuitOpen, r.Inflight
+}
 
 // statusClass maps an HTTP status to "2xx"/"4xx"/"5xx" (other -> "5xx" bucket
 // is wrong; use exact class by hundreds digit).
@@ -154,20 +170,21 @@ func (r *Registry) Write(w io.Writer) {
 	r.tokens.write(w, "tokenroute_tokens_total", "Tokens processed, by kind (prompt/completion).")
 	r.cacheHits.write(w, "tokenroute_cache_hits_total", "Response cache hits.")
 	r.latency.write(w, "tokenroute_latency_seconds", "Upstream request latency in seconds.")
+	providers, circuitOpen, inflight := r.gaugeSnapshot()
 	fmt.Fprint(w, "# HELP tokenroute_circuit_open Circuit breaker open flag (1=open).\n# TYPE tokenroute_circuit_open gauge\n")
-	if r.Providers != nil && r.CircuitOpen != nil {
-		for _, p := range r.Providers() {
+	if providers != nil && circuitOpen != nil {
+		for _, p := range providers() {
 			v := 0
-			if r.CircuitOpen(p) {
+			if circuitOpen(p) {
 				v = 1
 			}
 			fmt.Fprintf(w, "tokenroute_circuit_open{provider=%q} %d\n", p, v)
 		}
 	}
 	fmt.Fprint(w, "# HELP tokenroute_inflight Live upstream requests per provider.\n# TYPE tokenroute_inflight gauge\n")
-	if r.Providers != nil && r.Inflight != nil {
-		for _, p := range r.Providers() {
-			fmt.Fprintf(w, "tokenroute_inflight{provider=%q} %d\n", p, r.Inflight(p))
+	if providers != nil && inflight != nil {
+		for _, p := range providers() {
+			fmt.Fprintf(w, "tokenroute_inflight{provider=%q} %d\n", p, inflight(p))
 		}
 	}
 }

@@ -464,6 +464,47 @@ Header `X-Admin-Key: <admin_key>` on every call:
 | `POST /admin/providers/{name}/circuit/reset` | Reset circuit breaker |
 | `POST /admin/providers/{name}/disable` / `/enable` | Disable/enable provider channel (enable resets breaker + auto-disable counter) |
 
+### Config API
+
+Header `X-Admin-Key: <admin_key>` is required on every config call — the
+`?key=` query param is NOT accepted here (URLs leak into logs). An empty
+`admin_key` disables all `/admin` routes (503 `admin_disabled`).
+
+| Route | Description |
+|---|---|
+| `GET /admin/config` | Snapshot: `{revision, document, raw_yaml, schema, restart_required_paths}`. `revision` is `sha256:<hex>` of the on-disk bytes. Literal secrets are replaced with the sentinel `__TOKENROUTE_KEEP_SECRET__`; `${VAR}` env references stay verbatim |
+| `POST /admin/config/validate` | Body `{expected_revision, mode, document?, raw_yaml?}` (`mode` = `raw` or `structured`). Merges the edit onto the current file and returns `{valid: true, base_revision, candidate_revision, document, raw_yaml, diff, changed_paths, restart_required_paths, warnings}`. Writes nothing |
+| `PUT /admin/config` | Body = validate body plus `candidate_revision` from the validate response. Re-checks both revisions, backs up, writes atomically, applies, rotates backups. Returns `{saved, applied, revision, restart_required, restart_required_paths}` |
+
+Semantics:
+
+- **Revision conflicts** — a stale `expected_revision` returns 409
+  `config_conflict`; a stale `candidate_revision` returns 409
+  (`ErrCandidateChanged`) — re-GET and re-validate before retrying.
+- **Secret sentinel** — `__TOKENROUTE_KEEP_SECRET__` means "keep the
+  on-disk value here". Sending it back at the same path preserves the
+  stored secret; sending it at any path that does not already hold a
+  literal secret is rejected (422 `sentinel_misuse`). It is not a value a
+  user should ever type — treat it as opaque.
+- **Validation errors** — 422 `{valid: false, errors: [{path, code, message}]}`.
+- **Backups** — before each write the prior bytes are copied to
+  `<config>.bak.<unix-nanos>` next to the config file; the newest **5**
+  backups are kept (older rotated out after a successful apply).
+- **Atomic writes** — candidate bytes are written to a temp file in the
+  same directory, synced, and renamed over the config.
+- **Restart-required fields** — `listen`, `admin_listen`, `usage_db`,
+  `admin_key`. Changing them saves to disk and is reported via
+  `restart_required: true` + `restart_required_paths`, but the runtime
+  keeps the running values (the process cannot rebind listeners or reopen
+  the DB hot); a process restart applies them. All other fields apply hot.
+- **Apply failure / recovery** — if the hot apply fails after the file was
+  saved, the exact prior bytes are restored to disk and the response is
+  500 with `{saved: true, applied: false, restored: true|false, ...}`.
+  Startup/SIGHUP behavior is unchanged: bad config is fatal at boot and
+  ignored on SIGHUP.
+- **Flow** — `GET` → edit → `POST /admin/config/validate` (review redacted
+  diff) → `PUT /admin/config` with the returned `candidate_revision`.
+
 Client-facing: `GET /v1/models`, `GET /v1/usage/recent?limit=N` (≤500),
 `GET /healthz` (unauthenticated).
 
@@ -472,7 +513,10 @@ Client-facing: `GET /v1/models`, `GET /v1/usage/recent?limit=N` (≤500),
 `GET /admin/` serves the self-contained dashboard. Open
 `http://localhost:8400/admin/?key=<admin_key>` in a browser (the key is
 stored in sessionStorage; header `X-Admin-Key` also works). Panels: API
-keys (enable/disable inline), usage aggregates, provider circuit states.
+keys (enable/disable inline), usage aggregates, provider circuit states,
+and Settings — a structured/raw editor backed by the config API with
+redacted diff confirmation, conflict draft preservation, and
+restart-required banners.
 
 ## Docker
 
@@ -499,14 +543,21 @@ GOOS=linux CGO_ENABLED=0 go build ./cmd/tokenroute   # container-equivalent buil
 ## Project layout
 
 ```
-cmd/tokenroute            main, flags, signals, hot reload
-internal/config        YAML load + validate + ${VAR} expansion
+cmd/tokenroute            main, flags, signals, hot reload, admin-apply reloader
+internal/config        YAML load + validate + ${VAR} expansion; store.go
+                       (config snapshots, candidate merge/validate, redacted
+                       diff, transactional commit with backups/rollback);
+                       schema.go (reflection-derived field schema: sections,
+                       advanced/secret/restart flags, identity keys)
 internal/provider      Provider interface + Request type
 internal/provider/openai     [OI]-compatible provider
 internal/provider/anthropic  Anthropic Messages adapter
 internal/provider/gemini     Gemini generateContent adapter
 internal/router        strategies, circuit breakers, EMA latency
-internal/server        chi handlers, failover loop, admin API, dashboard
+internal/server        chi handlers, failover loop, admin API, config API
+                       (config_admin.go: GET/validate/PUT /admin/config,
+                       header-only admin auth), embedded dashboard assets
+                       (dashboard.go + internal/server/web: settings UI)
 internal/usage         SQLite usage log, SSE token tracking, pricing
 internal/auth          virtual API keys (SQLite api_keys table)
 internal/ratelimit     per-key RPM/TPM token buckets

@@ -17,3 +17,6 @@ config.yaml
 Thumbs.db
 .vscode/
 .idea/
+
+# Spec-driven development workspace
+.superpowers/

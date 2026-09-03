@@ -54,7 +54,7 @@ func groupRatioSetup(t *testing.T, ratios map[string]float64) (http.Handler, *us
 	}
 	prices := map[string]usage.Price{"up": {PromptPer1M: 1.0}}
 	return NewWithOptions(Options{
-		Router: rt, Usage: ul, Prices: prices, Keys: keys, GroupRatio: ratios,
+		Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices), Keys: keys, GroupRatio: ratios,
 	}), ul, keys
 }
 

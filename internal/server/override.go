@@ -52,4 +52,3 @@ func HeaderPassMatch(patterns []string, name string) bool {
 	}
 	return false
 }
-

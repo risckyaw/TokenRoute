@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TokenRoute Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap">
+<link rel="stylesheet" href="/admin/assets/dashboard.css">
+</head>
+<body>
+<div id="app">
+  <aside>
+    <div class="wordmark">Token<span>Route</span></div>
+    <nav id="nav">
+      <a href="#overview" data-s="overview" class="active"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20a8 8 0 1 1 8-8"/><path d="M12 12l5-5"/><circle cx="12" cy="12" r="1.5"/></svg>Overview</a>
+      <a href="#keys" data-s="keys"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h8"/><path d="M17 12v3"/><path d="M20 12v2"/></svg>Keys</a>
+      <a href="#providers" data-s="providers"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01"/><path d="M7 17h.01"/></svg>Providers</a>
+      <a href="#logs" data-s="logs"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg>Logs</a>
+      <a href="#settings" data-s="settings"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Settings</a>
+    </nav>
+  </aside>
+  <main>
+    <header>
+      <input id="key" type="password" placeholder="admin key" aria-label="admin key">
+      <button class="btn" id="savekey">Save key</button>
+      <div id="live"><span id="dot" aria-hidden="true"></span><span id="livelabel">live</span> <span id="updated"></span></div>
+    </header>
+    <div id="errbar" role="alert"></div>
+
+    <section id="s-overview" class="active">
+      <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20a8 8 0 1 1 8-8"/><path d="M12 12l5-5"/><circle cx="12" cy="12" r="1.5"/></svg>Overview</h2>
+      <div class="kpis">
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>Total requests</div><div class="value" id="k-req" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16"/><path d="M9 4v16"/><path d="M15 4v16"/><path d="M19 4v16"/><path d="M3 8h18"/><path d="M3 16h18"/></svg>Total tokens</div><div class="value" id="k-tok" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v10"/><path d="M15 9.5c-.6-1-1.7-1.5-3-1.5-1.7 0-3 .8-3 2.25s1.3 1.9 3 2.25c1.7.35 3 .8 3 2.25S13.7 17 12 17c-1.3 0-2.4-.5-3-1.5"/></svg>Total cost USD</div><div class="value accent" id="k-cost" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+        <div class="card kpi"><div class="label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="7"/><path d="M12 10v3l2 2"/><path d="M9 3h6"/></svg>Avg latency ms</div><div class="value" id="k-lat" data-v="-" role="status" aria-live="off" aria-atomic="true">-</div></div>
+      </div>
+      <div class="card" id="reqchart">
+        <h3><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-6 4 3 6-8"/><path d="M3 21h18"/></svg>Requests per minute &middot; last 30 min</h3>
+        <div id="reqchart-body"><div class="empty">Loading&hellip;</div></div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h3>Cost per key</h3>
+          <div id="costchart"></div>
+        </div>
+        <div class="card">
+          <h3>Providers</h3>
+          <div id="provmini"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="s-keys">
+      <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h8"/><path d="M17 12v3"/><path d="M20 12v2"/></svg>API Keys</h2>
+      <div id="newkey">
+        <div style="color:var(--muted);font-size:12px">Key created. Copy it now; it will not be shown again.</div>
+        <div class="k" id="newkey-val"></div>
+        <button class="btn primary sm" id="copykey">Copy</button>
+      </div>
+      <div class="formrow card" style="padding:12px 16px">
+        <div class="field"><label for="f-name">Name</label><input id="f-name" class="wide" placeholder="ci-bot"></div>
+        <div class="field"><label for="f-rpm">RPM</label><input id="f-rpm" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div class="field"><label for="f-tpm">TPM</label><input id="f-tpm" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div class="field"><label for="f-quota">Quota tokens</label><input id="f-quota" type="number" min="0" placeholder="0 = unlimited"></div>
+        <button class="btn primary" id="create">Create</button>
+      </div>
+      <details class="card" id="key-advanced" style="padding:8px 16px">
+        <summary>Advanced</summary>
+        <div class="formrow">
+          <div class="field"><label for="f-model-rpm">Model RPM</label><input id="f-model-rpm" type="number" min="0" placeholder="0 = unlimited"></div>
+          <div class="field"><label for="f-limit-header">Limit by header</label><input id="f-limit-header" placeholder="X-Team-Id"></div>
+          <div class="field"><label for="f-daily-quota">Daily quota</label><input id="f-daily-quota" type="number" min="0" placeholder="0 = unlimited"></div>
+          <div class="field"><label for="f-budget">Budget USD</label><input id="f-budget" type="number" min="0" step="0.01" placeholder="0 = unlimited"></div>
+          <div class="field"><label for="f-models">Allowed models</label><input id="f-models" placeholder="auto, gpt-4o (comma-sep, empty = all)"></div>
+          <div class="field"><label for="f-groups">Groups</label><input id="f-groups" placeholder="ci, batch (comma-sep)"></div>
+          <div class="field"><label for="f-expires">Expires at</label><input id="f-expires" type="datetime-local"></div>
+        </div>
+      </details>
+      <div id="create-err" role="alert"></div>
+      <div class="card" style="padding:4px 8px">
+        <div class="tblwrap">
+        <table id="keys">
+          <thead><tr><th></th><th>Name</th><th>Key</th><th>Spent</th><th>Enabled</th><th style="text-align:right">Actions</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="s-providers">
+      <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01"/><path d="M7 17h.01"/></svg>Providers</h2>
+      <div class="card" style="padding:4px 8px">
+        <div class="tblwrap">
+        <table id="providers">
+          <thead><tr><th>Name</th><th>Priority</th><th>EMA latency ms</th><th>Circuit</th><th style="text-align:right">Actions</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="s-logs">
+      <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg>Request logs</h2>
+      <div class="toolbar"><button class="btn sm" id="export-csv">Export CSV</button></div>
+      <div class="card" style="padding:4px 8px">
+        <div class="tblwrap">
+        <table id="logs">
+          <thead><tr><th>Time</th><th>Key</th><th>Model</th><th>Provider</th><th>Tokens p/c/t</th><th>Status</th><th>Latency</th><th>Cost</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="s-settings">
+      <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Settings</h2>
+
+      <div class="settings-shell">
+        <div id="subnav" role="tablist" aria-label="Settings sections">
+          <button role="tab" data-sub="general" aria-selected="true">General</button>
+          <button role="tab" data-sub="providers" aria-selected="false">Providers</button>
+          <button role="tab" data-sub="routes" aria-selected="false">Routes</button>
+          <button role="tab" data-sub="pricing" aria-selected="false">Pricing</button>
+          <button role="tab" data-sub="resilience" aria-selected="false">Resilience</button>
+          <button role="tab" data-sub="search" aria-selected="false">Search</button>
+          <button role="tab" data-sub="advanced" aria-selected="false">Advanced</button>
+          <button role="tab" data-sub="raw" aria-selected="false">Raw YAML</button>
+        </div>
+
+        <div class="settings-main">
+          <div class="settings-toolbar">
+            <input id="settings-search" type="search" placeholder="Filter fields…" aria-label="Filter settings fields">
+            <div class="settings-actions">
+              <button class="btn sm" id="settings-add" disabled>Add</button>
+              <button class="btn sm" id="settings-duplicate" disabled>Duplicate</button>
+              <button class="btn sm" id="settings-move-up" disabled aria-label="Move item up">↑</button>
+              <button class="btn sm" id="settings-move-down" disabled aria-label="Move item down">↓</button>
+              <button class="btn sm danger" id="settings-delete" disabled>Delete</button>
+              <button class="btn sm" id="settings-discard" disabled>Discard</button>
+              <button class="btn sm primary" id="settings-validate" disabled>Validate</button>
+            </div>
+          </div>
+
+          <div id="settings-status" class="settings-status" role="status" aria-live="polite" hidden></div>
+
+          <div id="settings-body" class="card">
+            <div class="empty">Loading configuration…</div>
+          </div>
+          <div id="settings-raw-error" role="alert" hidden></div>
+        </div>
+      </div>
+
+      <!-- Accessible diff/confirm dialog (native <dialog>: built-in focus trap) -->
+      <dialog id="config-diff-dialog" role="dialog" aria-modal="true" aria-labelledby="config-diff-title">
+        <h3 id="config-diff-title" tabindex="-1">Review configuration changes</h3>
+        <div id="config-diff-warnings" class="diff-warnings" hidden></div>
+        <div id="config-diff-body"></div>
+        <div class="diff-actions">
+          <button class="btn sm" id="config-diff-cancel">Cancel</button>
+          <button class="btn sm primary" id="config-diff-confirm">Confirm save</button>
+        </div>
+      </dialog>
+
+    </section>
+  </main>
+</div>
+
+<script src="/admin/assets/dashboard.js"></script>
+</body>
+</html>

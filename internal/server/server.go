@@ -14,12 +14,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
+	"github.com/Jarvisagentic/tokenroute/internal/config"
 	"github.com/Jarvisagentic/tokenroute/internal/metrics"
 	"github.com/Jarvisagentic/tokenroute/internal/pricing"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
@@ -43,8 +43,8 @@ const ctxAPIKey ctxKey = iota
 type Options struct {
 	Router   *router.Router
 	Usage    *usage.Logger
-	Prices   map[string]usage.Price
-	Keys     *auth.Store // nil disables virtual-key auth
+	Prices   *usage.PriceStore // shared price store
+	Keys     *auth.Store       // nil disables virtual-key auth
 	Limiter  *ratelimit.Registry
 	AdminKey string // empty = /admin disabled (503)
 	// Cache enables the in-memory response cache when non-nil.
@@ -69,11 +69,17 @@ type Options struct {
 	MaxBodyMB int
 	// SearchBackends enables POST /v1/search when non-empty.
 	SearchBackends []search.Backend
+	// ConfigStore enables /admin/config endpoints; nil = 503 on those routes.
+	ConfigStore *config.Store
+	// ApplyConfig hot-applies a committed config; nil = no-op apply.
+	ApplyConfig config.ApplyFunc
+	// ValidateConfig constructs candidate runtime state without applying it.
+	ValidateConfig config.ValidateFunc
 }
 
 // New builds the handler. Kept for compatibility: auth disabled.
 func New(rt *router.Router, ul *usage.Logger, prices map[string]usage.Price) http.Handler {
-	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices})
+	return NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices)})
 }
 
 func NewWithOptions(o Options) http.Handler {
@@ -81,7 +87,8 @@ func NewWithOptions(o Options) http.Handler {
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, cache: o.Cache, metrics: o.Metrics,
 		streamIdleMs: o.StreamIdleMs, providerTypes: o.ProviderTypes, retryPolicy: o.RetryPolicy,
 		groupRatio: o.GroupRatio,
-		maxBody: maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends}
+		maxBody:    maxBodyBytes(o.MaxBodyMB), searchBackends: o.SearchBackends,
+		configStore: o.ConfigStore, applyConfig: o.ApplyConfig, validateConfig: o.ValidateConfig}
 	mux := chi.NewRouter()
 	mux.Use(correlationID)
 	mux.Get("/healthz", s.healthz)
@@ -108,7 +115,8 @@ func NewWithOptions(o Options) http.Handler {
 func NewAdminOnly(o Options) http.Handler {
 	s := &srv{router: o.Router, usage: o.Usage, prices: o.Prices,
 		keys: o.Keys, limiter: o.Limiter, adminKey: o.AdminKey, metrics: o.Metrics,
-		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB)}
+		streamIdleMs: o.StreamIdleMs, maxBody: maxBodyBytes(o.MaxBodyMB),
+		configStore: o.ConfigStore, applyConfig: o.ApplyConfig, validateConfig: o.ValidateConfig}
 	mux := chi.NewRouter()
 	mux.Get("/healthz", s.healthz)
 	if s.metrics != nil {
@@ -119,30 +127,46 @@ func NewAdminOnly(o Options) http.Handler {
 }
 
 func (s *srv) registerAdmin(mux chi.Router) {
+	// Static dashboard assets: no config/private payload, served unauthenticated.
+	mux.Get("/admin/assets/dashboard.css", s.adminDashboardCSS)
+	mux.Get("/admin/assets/dashboard.js", s.adminDashboardJS)
 	mux.Route("/admin", func(r chi.Router) {
 		r.Use(s.requireAdmin)
+		// Dashboard document + read APIs: header or ?key= query auth.
 		r.Get("/", s.adminDashboard)
-		r.Post("/keys", s.adminCreateKey)
 		r.Get("/keys", s.adminListKeys)
-		r.Post("/keys/{id}/disable", s.adminSetKey(false))
-		r.Post("/keys/{id}/enable", s.adminSetKey(true))
-		r.Delete("/keys/{id}", s.adminDeleteKey)
 		r.Get("/usage", s.adminUsage)
 		r.Get("/usage/logs", s.adminUsageLogs)
 		r.Get("/usage/export", s.adminUsageExport)
 		r.Get("/providers", s.adminProviders)
-		r.Post("/providers/{name}/test", s.adminProviderTest)
-		r.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
-		r.Post("/providers/{name}/disable", s.adminProviderDisable)
-		r.Post("/providers/{name}/enable", s.adminProviderEnable)
+		// Mutations: header-only auth — query keys leak into logs/proxies.
+		r.Group(func(m chi.Router) {
+			m.Use(s.requireAdminHeader)
+			m.Post("/keys", s.adminCreateKey)
+			m.Post("/keys/{id}/disable", s.adminSetKey(false))
+			m.Post("/keys/{id}/enable", s.adminSetKey(true))
+			m.Delete("/keys/{id}", s.adminDeleteKey)
+			m.Post("/providers/{name}/test", s.adminProviderTest)
+			m.Post("/providers/{name}/circuit/reset", s.adminCircuitReset)
+			m.Post("/providers/{name}/disable", s.adminProviderDisable)
+			m.Post("/providers/{name}/enable", s.adminProviderEnable)
+		})
+	})
+	// Config endpoints: header-only auth (no ?key=), no key-store dependency.
+	// Registered even when ConfigStore is nil so the 503 surface is stable.
+	mux.Route("/admin/config", func(r chi.Router) {
+		r.Use(s.requireAdminHeader)
+		r.Use(s.requireConfigStore)
+		r.Get("/", s.adminConfigGet)
+		r.Post("/validate", s.adminConfigValidate)
+		r.Put("/", s.adminConfigPut)
 	})
 }
 
 type srv struct {
 	router   *router.Router
 	usage    *usage.Logger
-	priceMu  sync.RWMutex // guards prices (pricing sync swaps the map)
-	prices   map[string]usage.Price
+	prices   *usage.PriceStore // shared, goroutine-safe price store
 	keys     *auth.Store
 	limiter  *ratelimit.Registry
 	adminKey string
@@ -156,17 +180,23 @@ type srv struct {
 	retryPolicy *router.RetryPolicy
 	// groupRatio: group name -> cost multiplier (nil = unset).
 	groupRatio map[string]float64
-	maxBody      int64
+	maxBody    int64
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
+	// configStore backs /admin/config; nil = 503 on those routes.
+	configStore *config.Store
+	// applyConfig hot-applies committed configs; nil = no-op.
+	applyConfig config.ApplyFunc
+	// validateConfig dry-runs runtime construction; nil skips the runtime layer.
+	validateConfig config.ValidateFunc
 }
 
-// price returns the price for a model (RLock; pricing sync may swap the map).
+// price returns the price for a model from the shared store.
 func (s *srv) price(model string) (usage.Price, bool) {
-	s.priceMu.RLock()
-	defer s.priceMu.RUnlock()
-	p, ok := s.prices[model]
-	return p, ok
+	if s.prices == nil {
+		return usage.Price{}, false
+	}
+	return s.prices.Get(model)
 }
 
 // estimateFamily maps a provider type to an estimator weight family.
@@ -191,13 +221,13 @@ func exprCost(e *usage.Entry, exprStr string, anthropicSemantics bool) (float64,
 		return 0, "", false
 	}
 	env := &pricing.Env{
-		P:  float64(e.PromptTokens),
-		C:  float64(e.CompletionTokens),
-		CR: float64(e.CacheReadTokens),
-		CC: float64(e.CacheCreateTokens),
+		P:   float64(e.PromptTokens),
+		C:   float64(e.CompletionTokens),
+		CR:  float64(e.CacheReadTokens),
+		CC:  float64(e.CacheCreateTokens),
 		Img: float64(e.ImageTokens),
-		Ai: float64(e.AudioInTokens),
-		Ao: float64(e.AudioOutTokens),
+		Ai:  float64(e.AudioInTokens),
+		Ao:  float64(e.AudioOutTokens),
 	}
 	pricing.Normalize(env, used, anthropicSemantics)
 	cost, tier, err := pricing.Eval(prog, env)
@@ -221,11 +251,9 @@ func (s *srv) chatCost(entry *usage.Entry, p *usage.Price) *float64 {
 	return usage.Cost(entry.PromptTokens, entry.CompletionTokens, p)
 }
 
-// SetPrices swaps the price map (pricing sync; config reload).
-func (s *srv) SetPrices(prices map[string]usage.Price) {
-	s.priceMu.Lock()
-	s.prices = prices
-	s.priceMu.Unlock()
+// SetPrices swaps the shared price store (pricing sync; config reload).
+func (s *srv) SetPrices(ps *usage.PriceStore) {
+	s.prices = ps
 }
 
 // maxBodyBytes converts MB to bytes; 0/negative -> 10MB default.

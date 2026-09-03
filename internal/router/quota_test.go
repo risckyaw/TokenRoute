@@ -84,10 +84,10 @@ func TestP2CPicksLeastLoadedOfTwo(t *testing.T) {
 
 func TestAutoPrefersCheaperHealthy(t *testing.T) {
 	r := New(nil, nil)
-	r.SetPrices(map[string]usage.Price{
+	r.SetPrices(usage.NewPriceStore(map[string]usage.Price{
 		"cheap":     {PromptPer1M: 0.1, CompletionPer1M: 0.1},
 		"expensive": {PromptPer1M: 9, CompletionPer1M: 9},
-	})
+	}))
 	// Poison b's health so the expensive AND unhealthy candidate clearly loses.
 	for i := 0; i < 10; i++ {
 		r.RecordResult("b", time.Millisecond, false)

@@ -152,7 +152,7 @@ func readClose(resp *http.Response) (io.ReadCloser, error) {
 
 // fusionCost is prompt+completion price for tie-breaking; unknown = +Inf-ish.
 func (s *srv) fusionCost(model string) float64 {
-	if p, ok := s.prices[model]; ok {
+	if p, ok := s.price(model); ok {
 		return p.PromptPer1M + p.CompletionPer1M
 	}
 	return 1e18

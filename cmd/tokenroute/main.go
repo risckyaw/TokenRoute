@@ -11,17 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Jarvisagentic/tokenroute/internal/auth"
-	"github.com/Jarvisagentic/tokenroute/internal/catalog"
 	"github.com/Jarvisagentic/tokenroute/internal/config"
 	"github.com/Jarvisagentic/tokenroute/internal/metrics"
-	"github.com/Jarvisagentic/tokenroute/internal/pricing"
 	"github.com/Jarvisagentic/tokenroute/internal/provider"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/anthropic"
 	"github.com/Jarvisagentic/tokenroute/internal/provider/gemini"
@@ -38,7 +35,7 @@ import (
 type serverState struct {
 	router   *router.Router
 	usage    *usage.Logger
-	prices   map[string]usage.Price
+	prices   *usage.PriceStore // shared, goroutine-safe price store
 	keys     *auth.Store
 	limiter  *ratelimit.Registry
 	adminKey string
@@ -52,18 +49,22 @@ type serverState struct {
 	retryPolicy *router.RetryPolicy
 	// groupRatio: group name -> cost multiplier (nil = unset).
 	groupRatio map[string]float64
-	maxBodyMB    int
+	maxBodyMB  int
 	// searchBackends: ordered web-search upstreams for /v1/search.
 	searchBackends []search.Backend
 	// modalities: model -> synced input modalities (catalog sync); nil when the
 	// catalog is off. Survives reloads so the swapped router keeps the lookup.
 	modalities func(string) ([]string, bool)
+	// workersCancel cancels this state's background workers (health checks,
+	// balance probes, model-catalog sync, pricing sync). Owned per state.
+	workersCancel context.CancelFunc
 }
 
-// buildState builds a fresh server state. sharedPrices nil (startup) creates
-// a new map; non-nil (reload) reuses it so background syncers (model catalog,
-// LiteLLM pricing) keep writing the map the router and server read.
-func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serverState, error) {
+// buildState builds a fresh server state. sharedPrices is always nil in
+// production (startup and reload both build a fresh store seeded only from
+// cfg.Prices, so removed config prices disappear); the parameter exists so
+// tests can inject a pre-seeded store.
+func buildState(cfg *config.Config, sharedPrices *usage.PriceStore) (*serverState, error) {
 	provs := make([]provider.Provider, 0, len(cfg.Providers))
 	byName := map[string]provider.Provider{}
 	sit := map[string]int{} // stream idle timeout ms per provider name
@@ -158,13 +159,13 @@ func buildState(cfg *config.Config, sharedPrices map[string]usage.Price) (*serve
 	}
 	prices := sharedPrices
 	if prices == nil {
-		prices = make(map[string]usage.Price, len(cfg.Prices))
+		prices = usage.NewPriceStore(nil)
 	}
-	// Overlay config prices on the shared map: config always wins over
-	// synced entries (OmniRoute resolution order). Config entries removed
-	// from YAML linger until restart — acceptable last-good semantics.
+	// Seed config prices into the fresh store: config always wins over
+	// synced entries (OmniRoute resolution order). Reload builds a new
+	// store, so prices removed from YAML actually disappear.
 	for m, pc := range cfg.Prices {
-		prices[m] = usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens, Expr: pc.Expr}
+		prices.Set(m, usage.Price{PromptPer1M: pc.PromptPer1M, CompletionPer1M: pc.CompletionPer1M, EmbedPer1M: pc.EmbedPer1M, ContextTokens: pc.ContextTokens, Expr: pc.Expr})
 	}
 	rt := router.New(provs, routes)
 	rt.SetPrices(prices)
@@ -335,15 +336,16 @@ func openDB(path string) (*sql.DB, error) {
 // bindMetrics points the registry's circuit gauge at the live router.
 // Called again on reload so the gauge follows the swapped router.
 func bindMetrics(m *metrics.Registry, rt *router.Router) {
-	m.Providers = func() []string {
+	m.BindGauges(func() []string {
 		names := []string{}
 		for _, p := range rt.Providers() {
 			names = append(names, p.Name())
 		}
 		return names
-	}
-	m.CircuitOpen = func(name string) bool { return rt.CircuitState(name) == "open" }
-	m.Inflight = func(name string) int { return rt.Inflight(name) }
+	},
+		func(name string) bool { return rt.CircuitState(name) == "open" },
+		func(name string) int { return rt.Inflight(name) },
+	)
 }
 
 func main() {
@@ -388,36 +390,22 @@ func main() {
 	state.metrics = mreg
 	bindMetrics(mreg, state.router)
 
-	// Daily model-capability sync (models.dev) — strictly additive below
-	// the hand-written price table; "off" disables. Its per-model input
-	// modalities also feed capability-aware candidate ordering.
-	if !strings.EqualFold(cfg.ModelCatalog, "off") {
-		syncer := catalog.NewSyncer(
-			filepath.Join(filepath.Dir(cfg.UsageDB), "model-catalog.json"),
-			"", 0, state.prices,
-		)
-		state.modalities = syncer.Modalities
-		state.router.SetModalityLookup(syncer.Modalities)
-		go syncer.Run(context.Background())
-	}
-
-	// LiteLLM pricing sync — fills price gaps, config always wins; "off" disables.
-	if !strings.EqualFold(cfg.PricingSync, "off") {
-		psync := pricing.NewSyncer(state.prices)
-		go psync.Run(context.Background(), 0)
-	}
-
-	// Background health checks (LiteLLM): per-provider probes keep circuit
-	// state and latency EMA warm; never touch quota ledger or usage log.
-	// Cancelled on shutdown via hcCancel.
-	hcCtx, hcCancel := context.WithCancel(context.Background())
-	defer hcCancel()
-	server.RunHealthChecks(hcCtx, state.router, healthTargets(cfg, state.router))
-	// Account-balance probes (opt-in per provider): pre-emptively mark
-	// low-balance providers exhausted in the quota ledger.
-	server.RunBalanceProbes(hcCtx, state.router, balanceTargets(cfg))
+	// Background workers owned by the initial state (model catalog, pricing
+	// sync, health checks, balance probes). Cancelled on shutdown.
+	wctx, wcancel := context.WithCancel(context.Background())
+	defer wcancel()
+	startStateWorkers(wctx, wcancel, cfg, state)
 	var current atomic.Pointer[serverState]
+	var activeConfig atomic.Pointer[config.Config]
 	current.Store(state)
+	activeConfig.Store(cfg)
+	reloader := &runtimeReloader{
+		current: &current, active: &activeConfig, metrics: mreg,
+		build:        buildState,
+		startWorkers: startStateWorkers,
+		dispose:      disposeRuntimeState,
+	}
+	configStore := config.NewStore(*configPath, 5)
 
 	log.Info("starting gateway",
 		"listen", cfg.Listen,
@@ -440,6 +428,9 @@ func main() {
 			GroupRatio:     st.groupRatio,
 			MaxBodyMB:      st.maxBodyMB,
 			SearchBackends: st.searchBackends,
+			ConfigStore:    configStore,
+			ApplyConfig:    reloader.Apply,
+			ValidateConfig: reloader.Validate,
 		}).ServeHTTP(w, r)
 	})
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler}
@@ -454,7 +445,10 @@ func main() {
 			server.NewAdminOnly(server.Options{
 				Router: st.router, Usage: st.usage, Prices: st.prices,
 				Keys: st.keys, Limiter: st.limiter, AdminKey: st.adminKey,
-				Metrics: st.metrics,
+				Metrics:        st.metrics,
+				ConfigStore:    configStore,
+				ApplyConfig:    reloader.Apply,
+				ValidateConfig: reloader.Validate,
 			}).ServeHTTP(w, r)
 			// admin-only mux has no proxied endpoints; body cap unused
 		})
@@ -483,32 +477,12 @@ func main() {
 					log.Error("reload config", "err", err)
 					continue
 				}
-				nstate, err := buildState(ncfg, current.Load().prices)
-				if err != nil {
+				// nil restart paths: explicit operator reload applies the
+				// complete persisted config (including listen address).
+				if err := reloader.Apply(context.Background(), ncfg, nil); err != nil {
 					log.Error("reload build state", "err", err)
 					continue
 				}
-				prev := current.Load()
-				nstate.usage = prev.usage
-				nstate.keys = prev.keys
-				nstate.limiter = prev.limiter
-				nstate.adminKey = ncfg.AdminKey
-				nstate.metrics = prev.metrics
-				bindMetrics(prev.metrics, nstate.router)
-				// The catalog syncer outlives reloads: re-point the new router
-				// at its modality lookup.
-				nstate.modalities = prev.modalities
-				if prev.modalities != nil {
-					nstate.router.SetModalityLookup(prev.modalities)
-				}
-				// Keep the warm cache unless reload toggled it off or changed TTL.
-				nstate.cache = prev.cache
-				if !ncfg.Cache.Enabled {
-					nstate.cache = nil
-				} else if nstate.cache == nil {
-					nstate.cache = server.NewCache(true, ncfg.Cache.TTLSeconds)
-				}
-				current.Store(nstate)
 				log.Info("config reloaded",
 					"providers", len(ncfg.Providers),
 					"routes", len(ncfg.Routes),
@@ -531,6 +505,9 @@ func main() {
 				continue
 			}
 			log.Info("shutting down", "signal", sig.String())
+			if st := current.Load(); st != nil && st.workersCancel != nil {
+				st.workersCancel()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if adminSrv != nil {

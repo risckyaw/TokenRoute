@@ -22,16 +22,16 @@ import (
 // LiteLLMURL is the community pricing catalog (same source OmniRoute uses).
 const LiteLLMURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
-// Syncer merges LiteLLM prices into a shared map (same pattern as
+// Syncer merges LiteLLM prices into a shared price store (same pattern as
 // internal/catalog: strictly additive — hand-written config prices win).
 type Syncer struct {
 	mu     sync.Mutex
-	prices map[string]usage.Price // shared with server/router; never reassigned
+	prices *usage.PriceStore // shared with router/server; never reassigned
 	models int
 }
 
-// NewSyncer binds the shared price map (the one passed to router/server).
-func NewSyncer(prices map[string]usage.Price) *Syncer {
+// NewSyncer binds the shared price store (the one passed to router/server).
+func NewSyncer(prices *usage.PriceStore) *Syncer {
 	return &Syncer{prices: prices}
 }
 
@@ -84,7 +84,7 @@ func (s *Syncer) Merge(catalog map[string]litellmEntry) int {
 			return
 		}
 		seen[name] = true
-		if _, ok := s.prices[name]; ok {
+		if s.prices.Has(name) {
 			return // config price wins (OmniRoute: user override > synced)
 		}
 		p := usage.Price{
@@ -98,7 +98,7 @@ func (s *Syncer) Merge(catalog map[string]litellmEntry) int {
 		if e.Mode == "embedding" {
 			p.EmbedPer1M = p.PromptPer1M
 		}
-		s.prices[name] = p
+		s.prices.Set(name, p)
 		added++
 	}
 	for name, e := range catalog {

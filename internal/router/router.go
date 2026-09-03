@@ -16,23 +16,23 @@ import (
 
 // Strategy names for per-route candidate ordering.
 const (
-	StrategyPriority     = "priority"
-	StrategyRoundRobin   = "round_robin"
-	StrategyLeastLatency = "least_latency"
-	StrategyWeighted     = "weighted"
-	StrategyCost         = "cost"
-	StrategyLKGP         = "lkgp" // last-known-good provider first
-	StrategyHeadroom     = "headroom"
-	StrategyFusion       = "fusion"      // race first 2 candidates concurrently
-	StrategyP2C          = "p2c"         // power-of-2-choices: pick 2 random, least-loaded wins
-	StrategyResetAware   = "reset_aware" // prefer candidates whose quota window resets soonest
-	StrategyFillFirst    = "fill_first"  // exhaust first candidate's quota before moving on
-	StrategyAuto         = "auto"        // composite multi-factor scoring (OmniRoute port)
-	StrategyLowestUsage  = "lowest_usage" // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
-	StrategyPeakEWMA     = "peak_ewma"   // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
-	StrategyLeastConn    = "least_connections" // fewest in-flight upstream requests first (Kong)
-	StrategyConsistentHash = "consistent_hash" // stateless ring on a request value (Kong)
-	StrategyFusionJudge    = "fusion_judge"    // panel fan-out + one judge model synthesizes
+	StrategyPriority       = "priority"
+	StrategyRoundRobin     = "round_robin"
+	StrategyLeastLatency   = "least_latency"
+	StrategyWeighted       = "weighted"
+	StrategyCost           = "cost"
+	StrategyLKGP           = "lkgp" // last-known-good provider first
+	StrategyHeadroom       = "headroom"
+	StrategyFusion         = "fusion"            // race first 2 candidates concurrently
+	StrategyP2C            = "p2c"               // power-of-2-choices: pick 2 random, least-loaded wins
+	StrategyResetAware     = "reset_aware"       // prefer candidates whose quota window resets soonest
+	StrategyFillFirst      = "fill_first"        // exhaust first candidate's quota before moving on
+	StrategyAuto           = "auto"              // composite multi-factor scoring (OmniRoute port)
+	StrategyLowestUsage    = "lowest_usage"      // fewest tokens in current minute (LiteLLM lowest_tpm_rpm_v2)
+	StrategyPeakEWMA       = "peak_ewma"         // Kong/Finagle peak-ewma: pick 2 random, lower ewma/weight wins
+	StrategyLeastConn      = "least_connections" // fewest in-flight upstream requests first (Kong)
+	StrategyConsistentHash = "consistent_hash"   // stateless ring on a request value (Kong)
+	StrategyFusionJudge    = "fusion_judge"      // panel fan-out + one judge model synthesizes
 )
 
 // ValidStrategy reports whether s is a known strategy name.
@@ -160,21 +160,20 @@ type Router struct {
 	// AffinityDefault is the global prompt_cache_affinity default; a route's
 	// own flag wins (Route.PromptCacheAffinity || AffinityDefault).
 	AffinityDefault bool
-	byName    map[string]provider.Provider
-	circuits  map[string]*CircuitBreaker
-	latency   map[string]*latencyState // decayed-EWMA latency ms per provider name
-	errRate   map[string]float64        // EMA error rate 0..1 per provider name
-	prices    map[string]usage.Price
-	mappings  map[string]map[string]string // provider name -> alias -> upstream model
-	priceMu   sync.RWMutex                 // guards prices
-	latMu     sync.Mutex
-	lockMu    sync.Mutex
-	modelLock map[string]time.Time // provider|model -> locked until
-	windows   map[string]*window   // provider name -> 60s tumbling counters
-	inflight  map[string]int       // provider name -> live upstream requests (least_connections)
-	quota     *QuotaLedger         // pre-request budget awareness (nil-safe)
-	aliases   map[string]string    // client model name -> virtual route model
-	affinity  *AffinityCache       // prompt-prefix pinning (nil = disabled)
+	byName          map[string]provider.Provider
+	circuits        map[string]*CircuitBreaker
+	latency         map[string]*latencyState     // decayed-EWMA latency ms per provider name
+	errRate         map[string]float64           // EMA error rate 0..1 per provider name
+	prices          *usage.PriceStore            // shared, goroutine-safe price store
+	mappings        map[string]map[string]string // provider name -> alias -> upstream model
+	latMu           sync.Mutex
+	lockMu          sync.Mutex
+	modelLock       map[string]time.Time // provider|model -> locked until
+	windows         map[string]*window   // provider name -> 60s tumbling counters
+	inflight        map[string]int       // provider name -> live upstream requests (least_connections)
+	quota           *QuotaLedger         // pre-request budget awareness (nil-safe)
+	aliases         map[string]string    // client model name -> virtual route model
+	affinity        *AffinityCache       // prompt-prefix pinning (nil = disabled)
 	// overrides: provider name -> set-only body/header ops (new-api port).
 	overrides map[string]ProviderOverride
 	// modalities: model -> supported non-text input modalities, from the
@@ -199,9 +198,9 @@ func (r *Router) FailureCooldown(providerName string, status int, bodySnippet st
 
 // ProviderOverride carries a provider's set-only request mutations.
 type ProviderOverride struct {
-	ParamSet  map[string]any
-	ParamDel  []string
-	HeaderSet map[string]string
+	ParamSet   map[string]any
+	ParamDel   []string
+	HeaderSet  map[string]string
 	HeaderPass []string // client header globs forwarded upstream
 }
 
@@ -332,19 +331,17 @@ func (r *Router) ResolveAlias(model string) string {
 	return model
 }
 
-// SetPrices installs the price map used by the cost and auto strategies.
-func (r *Router) SetPrices(prices map[string]usage.Price) {
-	r.priceMu.Lock()
-	r.prices = prices
-	r.priceMu.Unlock()
+// SetPrices installs the shared price store used by cost/auto strategies.
+func (r *Router) SetPrices(ps *usage.PriceStore) {
+	r.prices = ps
 }
 
-// price returns a model's price (RLock; pricing sync may swap the map).
+// price returns a model's price from the shared store.
 func (r *Router) price(model string) (usage.Price, bool) {
-	r.priceMu.RLock()
-	defer r.priceMu.RUnlock()
-	p, ok := r.prices[model]
-	return p, ok
+	if r.prices == nil {
+		return usage.Price{}, false
+	}
+	return r.prices.Get(model)
 }
 
 // SetModelMapping installs a provider's alias -> upstream-model map

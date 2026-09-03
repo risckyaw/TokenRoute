@@ -42,19 +42,19 @@ func TestParseAndMerge(t *testing.T) {
 		t.Fatalf("gpt-9 entry wrong: %+v", models["gpt-9"])
 	}
 
-	prices := map[string]usage.Price{
+	prices := usage.NewPriceStore(map[string]usage.Price{
 		"glm-9.9": {PromptPer1M: 1.0}, // hand-written wins
-	}
+	})
 	s := NewSyncer(filepath.Join(t.TempDir(), "cat.json"), "", 0, prices)
 	added := s.merge(models)
 	if added != 1 {
 		t.Fatalf("want 1 added (gpt-9 only), got %d", added)
 	}
-	if prices["gpt-9"].ContextTokens != 256000 {
-		t.Fatalf("gpt-9 context not merged: %+v", prices["gpt-9"])
+	if p, _ := prices.Get("gpt-9"); p.ContextTokens != 256000 {
+		t.Fatalf("gpt-9 context not merged: %+v", p)
 	}
-	if prices["glm-9.9"].PromptPer1M != 1.0 {
-		t.Fatalf("hand-written price clobbered: %+v", prices["glm-9.9"])
+	if p, _ := prices.Get("glm-9.9"); p.PromptPer1M != 1.0 {
+		t.Fatalf("hand-written price clobbered: %+v", p)
 	}
 }
 
@@ -71,15 +71,15 @@ func TestSyncOnceETag(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	prices := map[string]usage.Price{}
+	prices := usage.NewPriceStore(nil)
 	s := NewSyncer(filepath.Join(t.TempDir(), "cat.json"), srv.URL, 0, prices)
 	ctx := context.Background()
 
 	if err := s.SyncOnce(ctx); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
-	if prices["gpt-9"].ContextTokens != 256000 {
-		t.Fatalf("merge after sync failed: %+v", prices)
+	if p, _ := prices.Get("gpt-9"); p.ContextTokens != 256000 {
+		t.Fatalf("merge after sync failed: %+v", prices.Snapshot())
 	}
 	if err := s.SyncOnce(ctx); err != nil {
 		t.Fatalf("second sync (304): %v", err)
@@ -92,7 +92,7 @@ func TestSyncOnceETag(t *testing.T) {
 // Modalities exposes synced non-text input modalities for capability routing;
 // unknown models must report ok=false, not an empty (text-only) list.
 func TestModalitiesLookup(t *testing.T) {
-	s := NewSyncer(filepath.Join(t.TempDir(), "cat.json"), "", 0, map[string]usage.Price{})
+	s := NewSyncer(filepath.Join(t.TempDir(), "cat.json"), "", 0, usage.NewPriceStore(nil))
 	s.merge(parse([]byte(sample)))
 
 	mods, ok := s.Modalities("gpt-9")

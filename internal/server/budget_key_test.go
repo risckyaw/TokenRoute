@@ -37,7 +37,7 @@ func TestKeyBudget_402AfterExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 	prices := map[string]usage.Price{"up-model": {PromptPer1M: 1, CompletionPer1M: 1}}
-	h := NewWithOptions(Options{Router: rt, Usage: ul, Prices: prices, Keys: keys})
+	h := NewWithOptions(Options{Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices), Keys: keys})
 
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto"}`))

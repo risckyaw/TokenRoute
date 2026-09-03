@@ -122,10 +122,10 @@ func TestStrategyCost(t *testing.T) {
 		{Provider: a, Model: "expensive"}, {Provider: b, Model: "unknown"}, {Provider: c, Model: "cheap"},
 	}}
 	r := New(provs, []*Route{rt})
-	r.SetPrices(map[string]usage.Price{
+	r.SetPrices(usage.NewPriceStore(map[string]usage.Price{
 		"expensive": {PromptPer1M: 10, CompletionPer1M: 30},
 		"cheap":     {PromptPer1M: 0.1, CompletionPer1M: 0.2},
-	})
+	}))
 	got := names(r.OrderCandidates(rt))
 	want := []string{"c", "a", "b"} // unknown price = last
 	for i := range want {

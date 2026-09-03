@@ -103,7 +103,7 @@ func TestExprPricing_AnthropicSemantics(t *testing.T) {
 	defer ul.Close()
 	prices := map[string]usage.Price{"up": {Expr: `p*3.0 + c*15.0 + cr*0.3`}}
 	h := NewWithOptions(Options{
-		Router: rt, Usage: ul, Prices: prices,
+		Router: rt, Usage: ul, Prices: usage.NewPriceStore(prices),
 		ProviderTypes: map[string]string{"fake": "anthropic"},
 	})
 	rec := httptest.NewRecorder()
